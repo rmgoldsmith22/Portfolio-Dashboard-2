@@ -92,7 +92,8 @@ h3 {{ font-size: 11px !important; color: {INK_SOFT} !important; font-weight: 600
     background-color: {PANEL_BG} !important;
     border-right: 1px solid {HAIRLINE} !important;
 }}
-[data-testid="stSidebar"] * {{ font-family: 'Libre Franklin', sans-serif !important; }}
+[data-testid="stSidebar"] *:not([data-testid="stIconMaterial"]):not([class*="material-"]) {{ font-family: 'Libre Franklin', sans-serif !important; }}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{ color: {INK} !important; }}
 
 /* Metric cards — flat, hairline border, no rounded corners */
 [data-testid="metric-container"] {{
@@ -202,16 +203,46 @@ input, textarea, [data-baseweb="input"] > div, [data-baseweb="textarea"] > div {
 
 [data-testid="stDataFrame"], [data-testid="stTable"] {{
     font-family: 'Libre Franklin', sans-serif !important;
-    font-size: 11px !important;
+    font-size: 12px !important;
 }}
-p, li, span, div {{ font-family: 'Libre Franklin', sans-serif !important; }}
 
-/* Captions */
-[data-testid="stCaption"] {{
+/* Body text → Libre Franklin, but DO NOT touch Material icon spans (their
+   font-family carries the glyph; overriding it prints the raw ligature text) */
+p, li, div,
+span:not([data-testid="stIconMaterial"]):not([class*="material-"]) {{
+    font-family: 'Libre Franklin', sans-serif !important;
+}}
+
+/* Force readable black body text even if Streamlit's base theme is dark.
+   Scoped to containers only: this sets an INHERITED value, so any element with
+   its own color (badges, deltas, indicators) still wins. */
+.stApp, [data-testid="stMarkdownContainer"] {{
+    color: {INK} !important;
+}}
+h4, h5, h6 {{ color: {INK} !important; font-family: 'Libre Franklin', sans-serif !important;
+              font-weight: 600 !important; letter-spacing: -0.005em !important; }}
+h4 {{ font-size: 14px !important; }}
+
+/* Restore Material icon fonts (the broad rule above must not clobber them) */
+span[data-testid="stIconMaterial"], .material-icons, .material-icons-outlined,
+.material-symbols-rounded, .material-symbols-outlined {{
+    font-family: 'Material Symbols Rounded','Material Symbols Outlined','Material Icons' !important;
+}}
+
+/* Light surfaces for uploader / inputs regardless of base theme */
+[data-testid="stFileUploaderDropzone"] {{
+    background: #f4f4f1 !important;
+    border: 1px dashed {HAIRLINE} !important;
+}}
+[data-testid="stFileUploaderDropzone"] span:not([data-testid="stIconMaterial"]):not([class*="material-"]),
+[data-testid="stFileUploaderDropzone"] small {{ color: {INK_SOFT} !important; }}
+
+/* Captions — quiet, readable, normal case */
+[data-testid="stCaption"], [data-testid="stCaption"] p {{
     color: {APPLE_GRAY} !important;
-    font-size: 10px !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.08em !important;
+    font-size: 11px !important;
+    letter-spacing: 0 !important;
+    text-transform: none !important;
 }}
 
 /* Suppress input keyboard artifacts */
@@ -227,23 +258,34 @@ hr {{ border-color: {HAIRLINE} !important; border-top: 1px solid {HAIRLINE} !imp
     justify-content: flex-start !important;
 }}
 .period-selector [data-testid="stRadio"] [role="radiogroup"] label {{
+    display: flex !important;
+    align-items: center !important;
     background: {PANEL_BG};
     border: 1px solid {HAIRLINE};
-    padding: 7px 14px !important;
+    padding: 7px 15px !important;
     margin: 0 -1px 0 0 !important;
     cursor: pointer;
     border-radius: 0;
     transition: all 0.12s ease;
 }}
-.period-selector [data-testid="stRadio"] [role="radiogroup"] label > div:first-child {{
+/* Hide the radio input and its circular mark (the child div with no text),
+   keep the label text regardless of child order */
+.period-selector [data-testid="stRadio"] [role="radiogroup"] label input {{
+    position: absolute !important;
+    opacity: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
+    margin: 0 !important;
+}}
+.period-selector [data-testid="stRadio"] [role="radiogroup"] label > div:not(:has(p)) {{
     display: none !important;
 }}
-.period-selector [data-testid="stRadio"] [role="radiogroup"] label > div:last-child p {{
+.period-selector [data-testid="stRadio"] [role="radiogroup"] label p {{
     font-family: 'Libre Franklin', sans-serif !important;
     font-size: 10px !important;
-    font-weight: 500 !important;
+    font-weight: 600 !important;
     color: {APPLE_GRAY} !important;
-    letter-spacing: 0.1em !important;
+    letter-spacing: 0.08em !important;
     text-transform: uppercase !important;
     margin: 0 !important;
 }}
