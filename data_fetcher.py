@@ -85,6 +85,7 @@ def fetch_ticker_info(ticker: str) -> dict:
         "current_price": None, "market_cap": None, "beta": None,
         "sector": None, "dividend_yield": None,
         "week_52_high": None, "week_52_low": None,
+        "website": None, "long_name": None,
     }
     try:
         info = yf.Ticker(ticker, session=_SESSION).info
@@ -104,6 +105,8 @@ def fetch_ticker_info(ticker: str) -> dict:
             "dividend_yield": float(div_yield) if div_yield is not None else None,
             "week_52_high":   info.get("fiftyTwoWeekHigh"),
             "week_52_low":    info.get("fiftyTwoWeekLow"),
+            "website":        info.get("website"),
+            "long_name":      info.get("longName") or info.get("shortName"),
         }
     except Exception:
         return empty

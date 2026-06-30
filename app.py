@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import collections
 import io
+import math
 import pathlib
 
 import numpy as np
+import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -301,6 +305,18 @@ hr {{ border-color: {HAIRLINE} !important; border-top: 1px solid {HAIRLINE} !imp
 }}
 .period-selector [data-testid="stRadio"] > label {{ display: none !important; }}
 
+/* ── Timeframe label (sits beside the dropdown) ──────────────────────── */
+.tf-label {{
+    font-family: 'Libre Franklin', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: {INK_SOFT};
+    line-height: 38px;   /* vertically centers against the 38px select */
+    white-space: nowrap;
+}}
+
 /* ── Hero value display ──────────────────────────────────────────── */
 .hero-value {{
     font-family: 'Libre Franklin', sans-serif;
@@ -378,12 +394,13 @@ DISCLAIMER = (
 # ── Metric help text ──────────────────────────────────────────────────────────
 
 HELP = {
-    "beta":           "Sensitivity to the market. Beta 1.0 = moves with market; 1.5 = 50% more volatile.",
-    "var_1d":         "Maximum expected 1-day loss at 95% confidence — exceeded ~1 in 20 trading days.",
-    "sharpe":         "Return per unit of total risk: (Return − Risk-Free Rate) / Volatility. Above 1.0 is good; above 2.0 excellent.",
+    "beta":           "Beta measures a security's or portfolio's volatility relative to the overall market. The market has a beta of 1.0; a beta above 1.0 means it tends to move more than the market, and below 1.0 less than the market. (Investopedia)",
+    "var_1d":         "Value at Risk (VaR) estimates the maximum loss expected over a set time frame at a given confidence level. A 1-day 95% VaR is the loss not expected to be exceeded on about 19 of 20 trading days. (Investopedia)",
+    "sharpe":         "The Sharpe ratio is the average return earned in excess of the risk-free rate per unit of total risk (volatility): (Return − Risk-Free Rate) / Standard Deviation. A higher ratio means better risk-adjusted return; above 1.0 is generally considered good. (Investopedia)",
     "sortino":        "Like Sharpe, but penalises only downside moves. Preferred for retirement accounts.",
-    "max_dd":         "Largest peak-to-trough decline. The loss an investor who bought at the worst moment would experience.",
-    "hhi":            "Concentration: sum of squared weights. Under 0.15 = diversified; over 0.25 = concentrated.",
+    "max_dd":         "Maximum drawdown (MDD) is the largest peak-to-trough decline in value before a new peak is reached. It gauges downside risk over a period — the loss of someone who bought at the worst moment. (Investopedia)",
+    "hhi":            "The Herfindahl-Hirschman Index (HHI) measures concentration by summing the squares of each holding's portfolio weight. Higher values mean more concentration; under 0.15 is diversified and over 0.25 is concentrated. (Investopedia)",
+    "concentration":  "Concentration risk is the potential for loss from holding a large share of the portfolio in a single position. The more weight in one holding, the more company-specific (idiosyncratic) risk you carry. (Investopedia)",
     "cvar":           "Expected Shortfall: average loss on the worst 5% of days.",
     "calmar":         "Annual return / |Max Drawdown|. Above 1.0 means annual gain exceeds the worst historical loss.",
     "treynor":        "Excess return per unit of market risk (beta). Useful when this portfolio is one sleeve of a larger allocation.",
@@ -399,8 +416,8 @@ HELP = {
     "pain_ratio":     "Annualized return / Ulcer Index. Higher = better reward per unit of drawdown pain.",
     "omega":          "Probability-weighted ratio of gains vs losses above the risk-free rate. > 1.0 means gains outweigh losses.",
     "info_ratio":     "Active return / Tracking Error. > 0.5 = skilled active management.",
-    "div_score":      "Diversification score 1–10 based on pairwise correlation and number of holdings. Flag if < 4.",
-    "risk_score":     "Composite risk score 1–10 from beta (25%), annualized vol (30%), max drawdown (25%), VaR% (20%).",
+    "div_score":      "A composite 1–10 diversification score based on the average pairwise correlation between holdings and how many you hold. Lower correlation and more holdings score higher; a score under 4 flags weak diversification. (Composite metric)",
+    "risk_score":     "A composite 1–10 risk score combining portfolio beta (25%), annualized volatility (30%), max drawdown (25%), and 1-day VaR % (20%). Scores above 7 indicate speculative risk levels. (Composite metric)",
 }
 
 SECTION_EXPLAINERS = {
@@ -483,6 +500,93 @@ def cached_price_history(tickers_tuple: tuple, period: str, interval: str):
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_ticker_info(ticker: str) -> dict:
     return fetch_ticker_info(ticker)
+
+
+# ── Company logo + brand-color helpers (allocation chart) ──────────────────────
+
+try:
+    from PIL import Image
+    _HAS_PIL = True
+except Exception:  # Pillow not installed → skip color extraction, use fallback
+    _HAS_PIL = False
+
+# Curated fallback brand colors for common tickers (used when a logo / its color
+# can't be fetched). Keeps the allocation chart colorful even offline.
+BRAND_COLORS: dict[str, str] = {
+    "AAPL": "#0b0b0b", "MSFT": "#0078D4", "GOOGL": "#4285F4", "GOOG": "#4285F4",
+    "AMZN": "#FF9900", "TSLA": "#E82127", "NVDA": "#76B900", "META": "#1877F2",
+    "JPM": "#117ACA", "LLY": "#D52B1E", "V": "#1A1F71", "MA": "#EB001B",
+    "UNH": "#002677", "HD": "#F96302", "PG": "#003DA5", "KO": "#F40009",
+    "PEP": "#004B93", "COST": "#E31837", "DIS": "#113CCF", "NFLX": "#E50914",
+    "AMD": "#ED1C24", "INTC": "#0071C5", "CRM": "#00A1E0", "ORCL": "#F80000",
+    "ADBE": "#FA0F00", "WMT": "#0071CE", "XOM": "#FF1721", "CVX": "#0066B2",
+    "BAC": "#E11B22", "WFC": "#D71E2B", "PFE": "#0093D0", "MRK": "#00857C",
+    "ABBV": "#071D49", "T": "#00A8E0", "VZ": "#CD040B", "CSCO": "#1BA0D7",
+    "QQQ": "#6f42c1", "SPY": "#1d6fa5", "VOO": "#96281B", "VTI": "#9b1b30",
+}
+_FALLBACK_BRAND = "#5f6b7a"
+
+
+def _dominant_color(img_bytes: bytes) -> str | None:
+    """Most common saturated, non-white/black colour in a logo image."""
+    if not _HAS_PIL:
+        return None
+    try:
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+        im.thumbnail((64, 64))
+        counts: collections.Counter = collections.Counter()
+        for r, g, b, a in im.getdata():
+            if a < 128:
+                continue
+            if r > 232 and g > 232 and b > 232:   # near-white
+                continue
+            if r < 24 and g < 24 and b < 24:        # near-black
+                continue
+            counts[(r // 24 * 24, g // 24 * 24, b // 24 * 24)] += 1
+        if not counts:
+            return None
+        r, g, b = counts.most_common(1)[0][0]
+        return f"#{min(r,255):02x}{min(g,255):02x}{min(b,255):02x}"
+    except Exception:
+        return None
+
+
+def _domain_from_website(website: str | None) -> str | None:
+    if not website:
+        return None
+    d = website.replace("https://", "").replace("http://", "").replace("www.", "")
+    return d.split("/")[0].strip() or None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def brand_logo_and_color(ticker: str, website: str | None) -> tuple[str | None, str]:
+    """Return (logo_data_uri | None, hex_color). Always returns a usable colour.
+
+    Tries a ticker-based logo service first, then the company domain (Clearbit).
+    Network/parse failures degrade gracefully to a curated brand colour."""
+    fallback = BRAND_COLORS.get(ticker.upper(), _FALLBACK_BRAND)
+    domain = _domain_from_website(website)
+    sources = [f"https://financialmodelingprep.com/image-stock/{ticker.upper()}.png"]
+    if domain:
+        sources.append(f"https://logo.clearbit.com/{domain}")
+
+    for url in sources:
+        try:
+            resp = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200 or not resp.content or len(resp.content) < 200:
+                continue
+            ctype = resp.headers.get("Content-Type", "")
+            if "image" not in ctype:
+                continue
+            color = _dominant_color(resp.content) or fallback
+            mime = "image/png" if "png" in ctype else ("image/svg+xml" if "svg" in ctype else "image/jpeg")
+            if "svg" in mime:   # can't recolor/extract reliably from SVG; use as image only
+                color = BRAND_COLORS.get(ticker.upper(), color)
+            b64 = base64.b64encode(resp.content).decode("ascii")
+            return f"data:{mime};base64,{b64}", color
+        except Exception:
+            continue
+    return None, fallback
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -568,16 +672,17 @@ with st.sidebar:
 
 st.title("Portfolio Risk Dashboard")
 
-# Period selector pill bar
-st.markdown('<div class="period-selector">', unsafe_allow_html=True)
-period_label = st.radio(
-    "Period", PERIOD_OPTIONS,
-    index=6,  # 1Y default
-    horizontal=True,
-    label_visibility="collapsed",
-    key="period_selector",
-)
-st.markdown('</div>', unsafe_allow_html=True)
+# Timeframe dropdown — label sits to the left of the select
+tf_label_col, tf_select_col, _tf_spacer = st.columns([1, 2, 7])
+with tf_label_col:
+    st.markdown("<div class='tf-label'>Timeframe</div>", unsafe_allow_html=True)
+with tf_select_col:
+    period_label = st.selectbox(
+        "Timeframe", PERIOD_OPTIONS,
+        index=6,  # 1Y default
+        label_visibility="collapsed",
+        key="period_selector",
+    )
 period, interval = PERIOD_MAP[period_label]
 is_short_period = period_label in SHORT_PERIODS
 
@@ -887,13 +992,13 @@ with tab_overview:
         max_ticker = positions.loc[positions["Weight"].idxmax(), "Ticker"]
         if max_weight > 33:
             sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} exceeds 33%",
-                       delta_color="inverse")
+                       delta_color="inverse", help=HELP["concentration"])
         elif max_weight > 25:
             sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} above 25%",
-                       delta_color="inverse")
+                       delta_color="inverse", help=HELP["concentration"])
         else:
             sc3.metric("Concentration", f"{max_weight:.1f}%", f"Largest: {max_ticker}",
-                       delta_color="off")
+                       delta_color="off", help=HELP["concentration"])
 
         sc4.metric("HHI Index", _fmt(hhi, ".3f"),
                    "Concentrated (>0.25)" if hhi and hhi > 0.25 else
@@ -917,9 +1022,6 @@ with tab_overview:
         c4.metric("Max Drawdown",
                   f"{max_dd * 100:.2f}%" if max_dd is not None else "N/A",
                   delta_color="inverse", help=HELP["max_dd"])
-
-        with st.expander("What do these metrics mean?"):
-            st.markdown(SECTION_EXPLAINERS["overview"])
     else:
         _short_period_notice()
 
@@ -930,15 +1032,49 @@ with tab_overview:
 
     with col_pie:
         st.subheader("Allocation")
-        fig_pie = px.pie(positions, values="Value", names="Ticker", hole=0.5,
-                         color_discrete_sequence=["#2b2b2b", "#454541", "#5f5f5a", "#787873", "#92928c",
-                                                  "#3a3a36", "#54544f", "#6e6e69", "#888883"])
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label",
-                              textfont=dict(color="#ffffff", size=11))
-        fig_pie.update_layout(showlegend=False, height=320,
-                              paper_bgcolor="rgba(0,0,0,0)",
-                              margin=dict(t=10, b=10, l=0, r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
+        # Order slices largest → smallest, in a fixed order we control
+        alloc = positions[["Ticker", "Value"]].sort_values("Value", ascending=False).reset_index(drop=True)
+        alloc_total = float(alloc["Value"].sum()) or 1.0
+
+        slice_colors: list[str] = []
+        logo_images: list[dict] = []
+        cum = 0.0
+        for _, prow in alloc.iterrows():
+            tkr = prow["Ticker"]
+            frac = float(prow["Value"]) / alloc_total
+            website = (ticker_info.get(tkr) or {}).get("website")
+            logo_uri, color = brand_logo_and_color(tkr, website)
+            slice_colors.append(color)
+
+            # Place the logo at the slice mid-angle (clockwise from 12 o'clock).
+            # Square figure (W=H) ⇒ paper-coord radius renders as a true circle.
+            if logo_uri and frac >= 0.04:
+                mid = (cum + frac / 2.0)
+                theta = 2.0 * math.pi * mid          # clockwise from top
+                R = 0.30                              # inboard of the % labels
+                logo_images.append(dict(
+                    source=logo_uri, xref="paper", yref="paper",
+                    x=0.5 + R * math.sin(theta), y=0.5 + R * math.cos(theta),
+                    sizex=0.12, sizey=0.12, xanchor="center", yanchor="middle",
+                    sizing="contain", layer="above",
+                ))
+            cum += frac
+
+        fig_pie = go.Figure(go.Pie(
+            labels=alloc["Ticker"], values=alloc["Value"], hole=0.55,
+            sort=False, direction="clockwise", rotation=0,
+            marker=dict(colors=slice_colors, line=dict(color="#ffffff", width=1.5)),
+            textinfo="percent", textposition="inside",
+            insidetextfont=dict(size=11),
+            hovertemplate="<b>%{label}</b><br>%{percent} · $%{value:,.0f}<extra></extra>",
+        ))
+        fig_pie.update_layout(
+            showlegend=False, width=360, height=360,
+            paper_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=10, b=10, l=10, r=10),
+            images=logo_images,
+        )
+        st.plotly_chart(fig_pie, use_container_width=False)
 
     with col_sector:
         st.subheader("Sector vs S&P 500")
@@ -956,20 +1092,23 @@ with tab_overview:
         fig_sec = go.Figure()
         fig_sec.add_trace(go.Bar(
             name="Portfolio", x=sec_merged["Portfolio %"], y=sec_merged["Sector"],
-            orientation="h", marker_color=APPLE_WHITE,
+            orientation="h", marker_color="#2a78d6",
             text=sec_merged["Portfolio %"].apply(lambda v: f"{v:.1f}%"), textposition="outside",
+            textfont=dict(color="#3d3d3a"),
         ))
         fig_sec.add_trace(go.Bar(
             name="S&P 500", x=sec_merged["S&P 500 %"], y=sec_merged["Sector"],
-            orientation="h", marker_color="#bdbdb7",
+            orientation="h", marker_color="#aeb4bd",
             text=sec_merged["S&P 500 %"].apply(lambda v: f"{v:.1f}%"), textposition="outside",
+            textfont=dict(color="#6b6b66"),
         ))
         fig_sec.update_layout(
             barmode="group", height=320,
-            legend=dict(orientation="h", y=-0.15, x=0, font=dict(color=APPLE_GRAY)),
+            legend=dict(orientation="h", y=-0.15, x=0, font=dict(color="#3d3d3a")),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font_color=APPLE_GRAY, margin=dict(t=10, b=40, l=0, r=20),
             xaxis_title="Weight (%)", yaxis_title=None,
+            yaxis=dict(tickfont=dict(color="#3d3d3a", size=11.5)),
         )
         st.plotly_chart(fig_sec, use_container_width=True)
 
