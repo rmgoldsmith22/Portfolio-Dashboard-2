@@ -684,15 +684,97 @@ with tf_select_col:
 period, interval = PERIOD_MAP[period_label]
 is_short_period = period_label in SHORT_PERIODS
 
+# ── Portfolio CSV normalization (native OR brokerage export) ───────────────────
+
+_TICKER_KEYS   = ("symbol", "ticker", "sym")
+_SHARES_KEYS   = ("qty", "quantity", "shares", "units")
+_AVGCOST_KEYS  = ("avg cost", "average cost", "cost/share", "cost per share",
+                  "avg price", "average price")
+_COSTBASIS_KEYS = ("cost basis", "total cost")
+_NONPOSITION_RE = r"TOTAL|CASH|ACCOUNT|SUBTOTAL|^--$"
+
+
+def _clean_number(x) -> float | None:
+    """Turn '$2,336.42', '11.98%', '--', '' into a float or None."""
+    if x is None:
+        return None
+    s = str(x).replace("$", "").replace(",", "").replace("%", "").strip()
+    if s.lower() in ("", "--", "n/a", "na", "nan", "none"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _raw_csv_text(source) -> str:
+    if hasattr(source, "getvalue"):
+        data = source.getvalue()
+        return data.decode("utf-8-sig", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+    with open(source, "r", encoding="utf-8-sig", errors="replace") as fh:
+        return fh.read()
+
+
+def normalize_portfolio_csv(source) -> pd.DataFrame:
+    """Parse a portfolio CSV into Ticker / Shares / Avg_Cost.
+
+    Accepts the app's native format (Ticker, Shares, Avg_Cost) and common
+    brokerage 'Positions' exports (e.g. Schwab/Fidelity) that have a title row
+    before the header, currency-formatted numbers, a total cost-basis column
+    instead of per-share cost, and Cash/Total footer rows.
+    """
+    text = _raw_csv_text(source)
+    lines = text.splitlines()
+
+    # Find the header row: first line that has a ticker-like column.
+    header_idx = 0
+    for i, line in enumerate(lines):
+        fields = [f.strip().strip('"').lower().replace("_", " ") for f in line.split(",")]
+        if len(fields) >= 2 and any(any(k in f for k in _TICKER_KEYS) for f in fields):
+            header_idx = i
+            break
+
+    raw = pd.read_csv(io.StringIO(text), skiprows=header_idx, dtype=str, keep_default_na=False)
+    low = {c: str(c).strip().strip('"').lower().replace("_", " ") for c in raw.columns}
+
+    def _find(keys):
+        for col, name in low.items():
+            if any(k in name for k in keys):
+                return col
+        return None
+
+    tcol, scol = _find(_TICKER_KEYS), _find(_SHARES_KEYS)
+    acol, ccol = _find(_AVGCOST_KEYS), _find(_COSTBASIS_KEYS)
+    if tcol is None or scol is None:
+        return raw  # let downstream validation surface a clear message
+
+    out = pd.DataFrame()
+    out["Ticker"] = raw[tcol].astype(str).str.strip().str.upper().str.replace("/", "-", regex=False)
+    out["Shares"] = raw[scol].map(_clean_number)
+    out["Avg_Cost"] = raw[acol].map(_clean_number) if acol else None
+
+    # Derive per-share cost from a total cost-basis column when needed.
+    if ccol is not None:
+        basis = raw[ccol].map(_clean_number)
+        need = out["Avg_Cost"].isna() & out["Shares"].notna() & (out["Shares"] != 0) & basis.notna()
+        out.loc[need, "Avg_Cost"] = basis[need] / out.loc[need, "Shares"]
+
+    # Drop cash / totals / blank rows and anything without usable numbers.
+    bad = out["Ticker"].str.contains(_NONPOSITION_RE, case=False, regex=True, na=True)
+    out = out[~bad].dropna(subset=["Shares", "Avg_Cost"])
+    out = out[out["Shares"] != 0]
+    return out.reset_index(drop=True)
+
+
 portfolio_df: pd.DataFrame | None = None
 if uploaded is not None:
     try:
-        portfolio_df = pd.read_csv(uploaded)
+        portfolio_df = normalize_portfolio_csv(uploaded)
     except Exception as exc:
         st.error(f"Could not parse CSV: {exc}")
         st.stop()
 elif st.session_state.get("use_sample"):
-    portfolio_df = pd.read_csv(HERE / "sample_portfolio.csv")
+    portfolio_df = normalize_portfolio_csv(HERE / "sample_portfolio.csv")
 else:
     st.info("Upload a portfolio CSV or click **Load Sample** in the sidebar to get started.")
     st.stop()
@@ -700,7 +782,13 @@ else:
 portfolio_df.columns = [c.strip().title().replace(" ", "_") for c in portfolio_df.columns]
 missing = {"Ticker", "Shares", "Avg_Cost"} - set(portfolio_df.columns)
 if missing:
-    st.error(f"CSV missing columns: {', '.join(sorted(missing))}")
+    st.error(
+        f"CSV missing columns: {', '.join(sorted(missing))}. "
+        "Expected a native file (Ticker, Shares, Avg_Cost) or a brokerage positions export."
+    )
+    st.stop()
+if portfolio_df.empty:
+    st.error("No valid positions found in the CSV after removing cash/total rows.")
     st.stop()
 
 portfolio_df["Ticker"] = portfolio_df["Ticker"].astype(str).str.strip().str.upper()
