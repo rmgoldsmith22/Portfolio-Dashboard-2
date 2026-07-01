@@ -666,8 +666,6 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Data: Yahoo Finance · Cache: 5 min")
 
-    sidebar_risk_placeholder = st.empty()
-
 # ── Resolve portfolio data ────────────────────────────────────────────────────
 
 st.title("Portfolio Risk Dashboard")
@@ -844,12 +842,7 @@ if risk_score_val is not None:
         if risk_score_val < upper:
             badge_color, badge_label = color, lbl
             break
-    sidebar_risk_placeholder.markdown(
-        f"<div style='font-size:11px; color:{APPLE_GRAY}; text-transform:uppercase; letter-spacing:0.08em;'>Portfolio Risk</div>"
-        f"<div style='font-size:18px; font-weight:700; color:{badge_color}; letter-spacing:-0.01em;'>{badge_label}</div>"
-        f"<div style='font-size:12px; color:{APPLE_GRAY};'>Risk Score: <b style='color:{APPLE_WHITE};'>{risk_score_val}/10</b></div>",
-        unsafe_allow_html=True,
-    )
+    # Rendered as a prominent banner at the top of the Overview tab (see below).
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -863,12 +856,15 @@ def _dark_chart(fig: go.Figure, height: int = 280) -> go.Figure:
         height=height,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
-        font_color=APPLE_GRAY,
+        font_color=INK,
+        legend=dict(font=dict(color=INK, size=12)),
         margin=dict(t=20, b=20, l=10, r=10),
         hovermode="x unified",
     )
-    fig.update_xaxes(showgrid=False, color=APPLE_GRAY, linecolor=SUBTLE)
-    fig.update_yaxes(gridcolor=SUBTLE, color=APPLE_GRAY, linecolor=SUBTLE)
+    fig.update_xaxes(showgrid=False, color=INK, linecolor=SUBTLE,
+                     tickfont=dict(color=INK), title_font=dict(color=INK))
+    fig.update_yaxes(gridcolor=SUBTLE, color=INK, linecolor=SUBTLE,
+                     tickfont=dict(color=INK), title_font=dict(color=INK))
     return fig
 
 
@@ -891,6 +887,26 @@ tab_overview, tab_risk, tab_bench, tab_mc, tab_holdings = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_overview:
+
+    # ── Portfolio risk banner (prominent, top of page) ───────────────────────
+    if risk_score_val is not None:
+        _risk_tints = {
+            APPLE_GREEN: ("#e9f5ed", "#1a7a3c"),
+            YELLOW:      ("#fcf3d9", "#8a6500"),
+            APPLE_RED:   ("#fbe9e9", "#a32d2d"),
+            APPLE_GRAY:  ("#f4f4f1", "#5f5f5a"),
+        }
+        _rbg, _rfg = _risk_tints.get(badge_color, ("#f4f4f1", "#5f5f5a"))
+        st.markdown(
+            f"<div style='display:flex; align-items:center; gap:16px; padding:12px 18px; "
+            f"background:{_rbg}; border:1px solid rgba(0,0,0,0.06); border-radius:10px; margin-bottom:16px;'>"
+            f"<span style='font-size:11px; font-weight:600; letter-spacing:0.12em; text-transform:uppercase; color:#5f5f5a;'>Portfolio Risk</span>"
+            f"<span style='font-size:20px; font-weight:700; color:{_rfg}; letter-spacing:0.03em;'>{badge_label}</span>"
+            f"<span style='font-size:13px; color:#5f5f5a; margin-left:auto;'>Risk Score "
+            f"<b style='color:#1a1a1a;'>{risk_score_val}/10</b></span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     # ── Hero number row ──────────────────────────────────────────────────────
     hero_col1, hero_col2 = st.columns([2, 3])
@@ -953,13 +969,28 @@ with tab_overview:
                 "Custom Benchmark": "#c4c4be",
             },
         )
-        fig_cmp.update_traces(line_width=2)
+        # Distinguish each series by BOTH shade and dash pattern so the legend
+        # is unambiguous even in a mostly-monochrome palette.
+        _line_style = {
+            "Your Portfolio":   (INK,       2.6, "solid"),
+            "S&P 500":          ("#4d5563", 1.8, "solid"),
+            "Nasdaq 100":       ("#7a808a", 1.8, "dash"),
+            "MSCI World":       ("#5f5f5a", 1.8, "dot"),
+            "Custom Benchmark": ("#9a9a94", 1.8, "dashdot"),
+        }
+        for _tr in fig_cmp.data:
+            _st = _line_style.get(_tr.name)
+            if _st:
+                _tr.line.color, _tr.line.width, _tr.line.dash = _st
         _dark_chart(fig_cmp, 380)
         fig_cmp.update_layout(
             yaxis_title="Growth of $100",
             xaxis_title=None,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            margin=dict(t=40, b=20, l=10, r=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+                        font=dict(color=INK, size=12.5),
+                        bgcolor="rgba(255,255,255,0.65)", borderwidth=0,
+                        title_text=""),
+            margin=dict(t=48, b=20, l=10, r=10),
         )
         st.plotly_chart(fig_cmp, use_container_width=True)
     else:
@@ -1051,11 +1082,11 @@ with tab_overview:
             if logo_uri and frac >= 0.04:
                 mid = (cum + frac / 2.0)
                 theta = 2.0 * math.pi * mid          # clockwise from top
-                R = 0.30                              # inboard of the % labels
+                R = 0.315                             # centered in the colored ring
                 logo_images.append(dict(
                     source=logo_uri, xref="paper", yref="paper",
                     x=0.5 + R * math.sin(theta), y=0.5 + R * math.cos(theta),
-                    sizex=0.12, sizey=0.12, xanchor="center", yanchor="middle",
+                    sizex=0.11, sizey=0.11, xanchor="center", yanchor="middle",
                     sizing="contain", layer="above",
                 ))
             cum += frac
@@ -1064,14 +1095,14 @@ with tab_overview:
             labels=alloc["Ticker"], values=alloc["Value"], hole=0.55,
             sort=False, direction="clockwise", rotation=0,
             marker=dict(colors=slice_colors, line=dict(color="#ffffff", width=1.5)),
-            textinfo="percent", textposition="inside",
-            insidetextfont=dict(size=11),
+            textinfo="percent", textposition="outside",   # % outside → no logo overlap
+            outsidetextfont=dict(size=12, color="#2b2b2b"),
             hovertemplate="<b>%{label}</b><br>%{percent} · $%{value:,.0f}<extra></extra>",
         ))
         fig_pie.update_layout(
-            showlegend=False, width=360, height=360,
+            showlegend=False, width=380, height=380,
             paper_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=10, l=10, r=10),
+            margin=dict(t=28, b=28, l=28, r=28),
             images=logo_images,
         )
         st.plotly_chart(fig_pie, use_container_width=False)
@@ -1103,12 +1134,14 @@ with tab_overview:
             textfont=dict(color="#6b6b66"),
         ))
         fig_sec.update_layout(
-            barmode="group", height=320,
-            legend=dict(orientation="h", y=-0.15, x=0, font=dict(color="#3d3d3a")),
+            barmode="group", height=340,
+            legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0,
+                        font=dict(color=INK, size=12)),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font_color=APPLE_GRAY, margin=dict(t=10, b=40, l=0, r=20),
-            xaxis_title="Weight (%)", yaxis_title=None,
-            yaxis=dict(tickfont=dict(color="#3d3d3a", size=11.5)),
+            font_color=INK, margin=dict(t=40, b=30, l=0, r=20),
+            xaxis=dict(title=dict(text="Weight (%)", font=dict(color=INK)),
+                       tickfont=dict(color="#3d3d3a")),
+            yaxis=dict(title=None, tickfont=dict(color="#3d3d3a", size=11.5)),
         )
         st.plotly_chart(fig_sec, use_container_width=True)
 
