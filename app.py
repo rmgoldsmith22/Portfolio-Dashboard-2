@@ -1131,20 +1131,20 @@ with tab_overview:
             labels={"value": "Growth of $100", "variable": ""},
             color_discrete_map={
                 "Your Portfolio":   INK,
-                "S&P 500":          "#8a8a84",
-                "Nasdaq 100":       "#b0b0aa",
-                "MSCI World":       "#6b6b66",
-                "Custom Benchmark": "#c4c4be",
+                "S&P 500":          "#2a78d6",
+                "Nasdaq 100":       "#d97706",
+                "MSCI World":       "#7c3aed",
+                "Custom Benchmark": "#0d9488",
             },
         )
         # Distinguish each series by BOTH shade and dash pattern so the legend
         # is unambiguous even in a mostly-monochrome palette.
         _line_style = {
-            "Your Portfolio":   (INK,       2.6, "solid"),
-            "S&P 500":          ("#4d5563", 1.8, "solid"),
-            "Nasdaq 100":       ("#7a808a", 1.8, "dash"),
-            "MSCI World":       ("#5f5f5a", 1.8, "dot"),
-            "Custom Benchmark": ("#9a9a94", 1.8, "dashdot"),
+            "Your Portfolio":   (INK,       2.8, "solid"),
+            "S&P 500":          ("#2a78d6", 1.8, "solid"),
+            "Nasdaq 100":       ("#d97706", 1.8, "dash"),
+            "MSCI World":       ("#7c3aed", 1.8, "dot"),
+            "Custom Benchmark": ("#0d9488", 1.8, "dashdot"),
         }
         for _tr in fig_cmp.data:
             _st = _line_style.get(_tr.name)
@@ -1416,8 +1416,8 @@ with tab_risk:
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number+delta",
                 value=port_beta,
-                delta={"reference": 1.0, "suffix": " vs market"},
-                number={"font": {"size": 44, "color": APPLE_WHITE}},
+                delta={"reference": 1.0, "suffix": " vs market", "font": {"size": 14}},
+                number={"font": {"size": 34, "color": APPLE_WHITE}},
                 gauge={
                     "axis": {"range": [0, gauge_max], "tickcolor": APPLE_GRAY},
                     "bar":  {"color": APPLE_WHITE, "thickness": 0.3},
@@ -1433,12 +1433,12 @@ with tab_risk:
             ))
             fig_gauge.update_layout(
                 height=280, paper_bgcolor="rgba(0,0,0,0)", font_color=APPLE_GRAY,
-                margin=dict(t=20, b=10, l=30, r=30),
+                margin=dict(t=20, b=52, l=30, r=30),
                 annotations=[
-                    dict(x=0.1, y=0.08, text="Defensive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                    dict(x=0.38, y=0.08, text="Conservative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                    dict(x=0.65, y=0.08, text="Aggressive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                    dict(x=0.90, y=0.08, text="Speculative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.1, y=-0.12, text="Defensive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.38, y=-0.12, text="Conservative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.65, y=-0.12, text="Aggressive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.90, y=-0.12, text="Speculative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
                 ],
             )
             st.plotly_chart(fig_gauge, use_container_width=True)
@@ -1489,10 +1489,10 @@ with tab_risk:
             if cvar_thresh is not None:
                 fig_hist.add_vline(x=cvar_thresh * 100, line_dash="dot", line_color=APPLE_RED,
                                    annotation_text=f"CVaR 95%: {cvar_thresh * 100:.2f}%",
-                                   annotation_position="top left")
+                                   annotation_position="bottom left")
             fig_hist.update_layout(xaxis_title="Daily Return (%)", yaxis_title="Frequency",
                                    barmode="overlay", showlegend=True,
-                                   legend=dict(orientation="h", y=1.05))
+                                   legend=dict(orientation="h", y=1.18))
             _dark_chart(fig_hist, 280)
             st.plotly_chart(fig_hist, use_container_width=True)
 
@@ -1580,7 +1580,7 @@ with tab_risk:
                 colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
             ))
             fig_corr.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)",
-                                   font_color=APPLE_GRAY, margin=dict(t=10, b=10, l=10, r=10))
+                                   font_color=INK, xaxis=dict(tickfont=dict(color=INK, size=12)), yaxis=dict(tickfont=dict(color=INK, size=12)), margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig_corr, use_container_width=True)
 
         with st.expander("What do these metrics mean?"):
@@ -1787,18 +1787,18 @@ with tab_mc:
             fig_mc.add_trace(go.Scatter(x=mc_df["year"], y=mc_df["p95"], mode="lines",
                                         line=dict(color="rgba(0,0,0,0)"), showlegend=False))
             fig_mc.add_trace(go.Scatter(x=mc_df["year"], y=mc_df["p5"], mode="lines",
-                                        fill="tonexty", fillcolor="rgba(0,0,0,0.05)",
+                                        fill="tonexty", fillcolor="rgba(42,120,214,0.12)",
                                         line=dict(color="rgba(0,0,0,0)"), name="5th–95th pct"))
             fig_mc.add_trace(go.Scatter(x=mc_df["year"], y=mc_df["p75"], mode="lines",
                                         line=dict(color="rgba(0,0,0,0)"), showlegend=False))
             fig_mc.add_trace(go.Scatter(x=mc_df["year"], y=mc_df["p25"], mode="lines",
-                                        fill="tonexty", fillcolor="rgba(0,0,0,0.10)",
+                                        fill="tonexty", fillcolor="rgba(42,120,214,0.28)",
                                         line=dict(color="rgba(0,0,0,0)"), name="25th–75th pct"))
             fig_mc.add_trace(go.Scatter(x=mc_df["year"], y=mc_df["p50"], mode="lines",
-                                        line=dict(color=APPLE_WHITE, width=2.5),
+                                        line=dict(color="#2a78d6", width=2.6),
                                         name="Median (nominal)"))
             fig_mc.add_trace(go.Scatter(x=mc_df_real["year"], y=mc_df_real["p50"], mode="lines",
-                                        line=dict(color=APPLE_GRAY, width=1.8, dash="dash"),
+                                        line=dict(color="#b8860b", width=1.8, dash="dash"),
                                         name=f"Median (real, {mc_inflation_rate * 100:.1f}% infl.)"))
             fig_mc.add_hline(y=total_value, line_dash="dot", line_color=SUBTLE,
                              annotation_text=f"Start ${total_value:,.0f}",
