@@ -364,6 +364,15 @@ HERE = pathlib.Path(__file__).parent
 BENCHMARKS: dict[str, str] = {"S&P 500": "^GSPC", "Nasdaq 100": "QQQ", "MSCI World": "ACWI"}
 PRIMARY_BENCH = "^GSPC"
 
+# Broadly-diversified index funds — a large weight in one of these is NOT
+# single-name concentration risk, so they're excluded from the concentration flag.
+BROAD_MARKET_ETFS: set[str] = {
+    "VOO", "VTI", "SPY", "IVV", "SPLG", "VV", "SCHB", "SCHX", "ITOT", "IWB",
+    "VONE", "SPTM", "FXAIX", "SWPPX", "VFIAX", "VTSAX", "FSKAX", "FZROX",
+    "QQQ", "QQQM", "ONEQ", "DIA", "VT", "ACWI", "URTH", "VTWO", "IWM",
+    "VXUS", "VEA", "VWO", "SCHD",
+}
+
 # ── Time period configuration ─────────────────────────────────────────────────
 
 PERIOD_OPTIONS = ["1D", "5D", "1M", "3M", "6M", "YTD", "1Y", "2Y", "5Y", "10Y", "MAX"]
@@ -587,6 +596,43 @@ def brand_logo_and_color(ticker: str, website: str | None) -> tuple[str | None, 
         except Exception:
             continue
     return None, fallback
+
+
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rgb_to_hex(r: float, g: float, b: float) -> str:
+    return f"#{max(0,min(255,int(r))):02x}{max(0,min(255,int(g))):02x}{max(0,min(255,int(b))):02x}"
+
+
+def _distinct_color(hex_color: str, used: list[str], thresh: float = 52.0) -> str:
+    """Nudge a colour's lightness until it's visibly distinct from ones already
+    used (fixes multiple same-brand holdings reading as one shade)."""
+    try:
+        rgb = _hex_to_rgb(hex_color)
+    except Exception:
+        return hex_color
+    used_rgb = []
+    for u in used:
+        try:
+            used_rgb.append(_hex_to_rgb(u))
+        except Exception:
+            pass
+
+    def _far_enough(c):
+        return all(sum((a - b) ** 2 for a, b in zip(c, u)) ** 0.5 >= thresh for u in used_rgb)
+
+    if _far_enough(rgb):
+        return hex_color
+    for factor in (0.72, 1.32, 0.55, 1.55, 0.42, 1.75):
+        cand = tuple(c * factor for c in rgb)
+        if _far_enough(cand):
+            return _rgb_to_hex(*cand)
+    return hex_color
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1107,23 +1153,41 @@ with tab_overview:
         else:
             sc2.metric("Diversification Score", "N/A")
 
-        max_weight = positions["Weight"].max()
-        max_ticker = positions.loc[positions["Weight"].idxmax(), "Ticker"]
-        if max_weight > 33:
-            sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} exceeds 33%",
-                       delta_color="inverse", help=HELP["concentration"])
-        elif max_weight > 25:
-            sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} above 25%",
-                       delta_color="inverse", help=HELP["concentration"])
-        else:
-            sc3.metric("Concentration", f"{max_weight:.1f}%", f"Largest: {max_ticker}",
+        # Concentration = largest SINGLE-NAME position. Broad-market index funds
+        # (e.g. VOO, VTI, QQQM) are diversified vehicles, so a big weight in one
+        # of them is not single-name risk — exclude them from the flag.
+        single_name = positions[~positions["Ticker"].isin(BROAD_MARKET_ETFS)]
+        if single_name.empty:
+            broad_wt = positions["Weight"].max()
+            sc3.metric("Concentration", f"{broad_wt:.1f}%", "Broad-market funds",
                        delta_color="off", help=HELP["concentration"])
+        else:
+            max_weight = single_name["Weight"].max()
+            max_ticker = single_name.loc[single_name["Weight"].idxmax(), "Ticker"]
+            if max_weight > 33:
+                sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} exceeds 33%",
+                           delta_color="inverse", help=HELP["concentration"])
+            elif max_weight > 25:
+                sc3.metric("Concentration", f"{max_weight:.1f}%", f"{max_ticker} above 25%",
+                           delta_color="inverse", help=HELP["concentration"])
+            else:
+                sc3.metric("Concentration", f"{max_weight:.1f}%", f"Largest single name: {max_ticker}",
+                           delta_color="off", help=HELP["concentration"])
 
-        sc4.metric("HHI Index", _fmt(hhi, ".3f"),
-                   "Concentrated (>0.25)" if hhi and hhi > 0.25 else
-                   ("Moderate" if hhi and hhi > 0.15 else "Diversified"),
-                   delta_color="inverse" if (hhi and hhi > 0.25) else "off",
-                   help=HELP["hhi"])
+        # If the portfolio's weight is dominated by broad-market funds, a high HHI
+        # reflects diversified index exposure, not single-name risk — don't red-flag it.
+        broad_weight = positions[positions["Ticker"].isin(BROAD_MARKET_ETFS)]["Weight"].sum()
+        broad_driven = broad_weight >= 40
+        if hhi and hhi > 0.25 and not broad_driven:
+            hhi_label, hhi_delta = "Concentrated (>0.25)", "inverse"
+        elif hhi and hhi > 0.25 and broad_driven:
+            hhi_label, hhi_delta = "Broad-market weighted", "off"
+        elif hhi and hhi > 0.15:
+            hhi_label, hhi_delta = "Moderate", "off"
+        else:
+            hhi_label, hhi_delta = "Diversified", "off"
+        sc4.metric("HHI Index", _fmt(hhi, ".3f"), hhi_label,
+                   delta_color=hhi_delta, help=HELP["hhi"])
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1151,49 +1215,42 @@ with tab_overview:
 
     with col_pie:
         st.subheader("Allocation")
-        # Order slices largest → smallest, in a fixed order we control
+        # Ranked horizontal bars: logo + ticker + brand-colored bar + weight %.
         alloc = positions[["Ticker", "Value"]].sort_values("Value", ascending=False).reset_index(drop=True)
         alloc_total = float(alloc["Value"].sum()) or 1.0
+        max_wt = float(alloc["Value"].max()) / alloc_total * 100 or 1.0
 
-        slice_colors: list[str] = []
-        logo_images: list[dict] = []
-        cum = 0.0
+        used_colors: list[str] = []
+        rows_html: list[str] = []
         for _, prow in alloc.iterrows():
             tkr = prow["Ticker"]
-            frac = float(prow["Value"]) / alloc_total
-            website = (ticker_info.get(tkr) or {}).get("website")
-            logo_uri, color = brand_logo_and_color(tkr, website)
-            slice_colors.append(color)
+            wt = float(prow["Value"]) / alloc_total * 100
+            info = ticker_info.get(tkr) or {}
+            logo_uri, color = brand_logo_and_color(tkr, info.get("website"))
+            color = _distinct_color(color, used_colors)
+            used_colors.append(color)
+            bar_w = max(4.0, wt / max_wt * 100)   # scale to largest; keep tiny ones visible
 
-            # Place the logo at the slice mid-angle (clockwise from 12 o'clock).
-            # Square figure (W=H) ⇒ paper-coord radius renders as a true circle.
-            if logo_uri and frac >= 0.04:
-                mid = (cum + frac / 2.0)
-                theta = 2.0 * math.pi * mid          # clockwise from top
-                R = 0.315                             # centered in the colored ring
-                logo_images.append(dict(
-                    source=logo_uri, xref="paper", yref="paper",
-                    x=0.5 + R * math.sin(theta), y=0.5 + R * math.cos(theta),
-                    sizex=0.11, sizey=0.11, xanchor="center", yanchor="middle",
-                    sizing="contain", layer="above",
-                ))
-            cum += frac
+            if logo_uri:
+                icon = (f"<img src='{logo_uri}' alt='{tkr}' style='width:26px;height:26px;"
+                        f"object-fit:contain;border-radius:5px;background:#fff;"
+                        f"border:0.5px solid #eee;flex:none;'/>")
+            else:
+                icon = (f"<div style='width:26px;height:26px;border-radius:5px;"
+                        f"background:{color};flex:none;'></div>")
 
-        fig_pie = go.Figure(go.Pie(
-            labels=alloc["Ticker"], values=alloc["Value"], hole=0.55,
-            sort=False, direction="clockwise", rotation=0,
-            marker=dict(colors=slice_colors, line=dict(color="#ffffff", width=1.5)),
-            textinfo="percent", textposition="outside",   # % outside → no logo overlap
-            outsidetextfont=dict(size=12, color="#2b2b2b"),
-            hovertemplate="<b>%{label}</b><br>%{percent} · $%{value:,.0f}<extra></extra>",
-        ))
-        fig_pie.update_layout(
-            showlegend=False, width=380, height=380,
-            paper_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=28, b=28, l=28, r=28),
-            images=logo_images,
-        )
-        st.plotly_chart(fig_pie, use_container_width=False)
+            rows_html.append(
+                "<div style='display:flex;align-items:center;gap:10px;padding:6px 0;"
+                "border-bottom:0.5px solid #eee;'>"
+                f"{icon}"
+                f"<div style='width:52px;flex:none;font-weight:600;font-size:13px;color:#1a1a1a;'>{tkr}</div>"
+                "<div style='flex:1;background:#f1f1ee;border-radius:5px;height:18px;min-width:30px;'>"
+                f"<div style='width:{bar_w:.1f}%;background:{color};height:100%;border-radius:5px;'></div></div>"
+                f"<div style='width:46px;flex:none;text-align:right;font-weight:600;font-size:13px;"
+                f"color:#1a1a1a;font-variant-numeric:tabular-nums;'>{wt:.1f}%</div>"
+                "</div>"
+            )
+        st.markdown("".join(rows_html), unsafe_allow_html=True)
 
     with col_sector:
         st.subheader("Sector vs S&P 500")
