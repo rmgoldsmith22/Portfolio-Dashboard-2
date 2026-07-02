@@ -1,8 +1,9 @@
-streamlit>=1.32.0
-yfinance>=0.2.36
-pandas>=2.0.0
-numpy>=1.24.0
-plotly>=5.18.0
-scipy>=1.11.0
-requests>=2.31.0
-Pillow>=10.0.0
+# Pinned exactly for reproducible installs. Run `pip-audit` before bumping.
+streamlit==1.44.1
+yfinance==0.2.55
+pandas==2.2.3
+numpy==1.26.4
+plotly==5.24.1
+scipy==1.13.1
+requests==2.32.3
+Pillow==11.1.0

@@ -119,7 +119,11 @@ SP500_SECTOR_WEIGHTS: dict[str, float] = {
 
 # ── Position building ─────────────────────────────────────────────────────────
 
-def build_positions(portfolio_df: pd.DataFrame, ticker_info: dict) -> pd.DataFrame:
+def build_positions(
+    portfolio_df: pd.DataFrame,
+    ticker_info: dict,
+    computed_betas: dict[str, float] | None = None,
+) -> pd.DataFrame:
     rows = []
     for _, row in portfolio_df.iterrows():
         ticker = str(row["Ticker"]).strip().upper()
@@ -138,7 +142,14 @@ def build_positions(portfolio_df: pd.DataFrame, ticker_info: dict) -> pd.DataFra
         cost_basis = shares * avg_cost
         pnl = value - cost_basis
         pnl_pct = (pnl / cost_basis * 100) if cost_basis else 0.0
-        beta = info.get("beta") if info.get("beta") is not None else 1.0
+        # Prefer beta computed from this window's actual price history vs the
+        # benchmark; fall back to Yahoo's figure. If neither exists leave NaN —
+        # assuming market beta badly distorts bonds/gold/crypto positions.
+        raw_beta = (computed_betas or {}).get(ticker, info.get("beta"))
+        try:
+            beta = float(raw_beta) if raw_beta is not None else float("nan")
+        except (TypeError, ValueError):
+            beta = float("nan")
         sector = (ETF_SECTOR_MAP.get(ticker)
                   or STOCK_SECTOR_MAP.get(ticker)
                   or info.get("sector")
@@ -153,7 +164,7 @@ def build_positions(portfolio_df: pd.DataFrame, ticker_info: dict) -> pd.DataFra
             "Cost_Basis":    cost_basis,
             "PnL":           pnl,
             "PnL_Pct":       pnl_pct,
-            "Beta":          float(beta),
+            "Beta":          beta,
             "Market_Cap":    info.get("market_cap"),
             "Sector":        sector,
             "Dividend_Yield": info.get("dividend_yield"),
@@ -174,7 +185,32 @@ def build_positions(portfolio_df: pd.DataFrame, ticker_info: dict) -> pd.DataFra
 # ── Core portfolio metrics ────────────────────────────────────────────────────
 
 def calc_portfolio_beta(positions_df: pd.DataFrame) -> float:
-    return float(positions_df["Beta_Contribution"].sum())
+    """Weighted-average beta over positions with a known beta (renormalized)."""
+    known = positions_df.dropna(subset=["Beta"])
+    w = float(known["Weight"].sum()) if not known.empty else 0.0
+    if w == 0:
+        return 0.0
+    return float((known["Beta"] * known["Weight"]).sum() / w)
+
+
+def calc_ticker_betas(
+    price_df: pd.DataFrame,
+    benchmark_returns: pd.Series | None,
+    min_obs: int = 60,
+) -> dict[str, float]:
+    """Per-ticker beta vs the benchmark, computed from fetched price history."""
+    betas: dict[str, float] = {}
+    if price_df.empty or benchmark_returns is None or benchmark_returns.empty:
+        return betas
+    rets = price_df.pct_change()
+    for t in rets.columns:
+        aligned = pd.DataFrame({"a": rets[t], "b": benchmark_returns}).dropna()
+        if len(aligned) < min_obs:
+            continue
+        bvar = float(aligned["b"].var())
+        if bvar > 0:
+            betas[t] = float(aligned["a"].cov(aligned["b"]) / bvar)
+    return betas
 
 
 def calc_correlation_matrix(price_df: pd.DataFrame) -> pd.DataFrame:
@@ -204,13 +240,14 @@ def calc_var(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     confidence: float = 0.95,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> dict:
     empty = {"var_1d": None, "var_5d": None, "var_1d_pct": None, "var_5d_pct": None}
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None:
         return empty
-    port_returns = port_returns.tail(lookback)
+    if lookback:
+        port_returns = port_returns.tail(lookback)
     if len(port_returns) < 30:
         return empty
     var_1d_pct = float(np.percentile(port_returns, (1 - confidence) * 100))
@@ -228,14 +265,15 @@ def calc_cvar(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     confidence: float = 0.95,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> dict:
     """Expected Shortfall: average loss beyond the VaR threshold."""
     empty = {"cvar_1d": None, "cvar_1d_pct": None}
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None:
         return empty
-    port_returns = port_returns.tail(lookback)
+    if lookback:
+        port_returns = port_returns.tail(lookback)
     if len(port_returns) < 30:
         return empty
     threshold = np.percentile(port_returns, (1 - confidence) * 100)
@@ -253,13 +291,14 @@ def calc_cvar(
 def calc_var_multi_confidence(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> dict | None:
     """VaR and CVaR at 90%, 95%, 99% confidence levels."""
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return None
-    port_returns = port_returns.tail(lookback)
+    if lookback:
+        port_returns = port_returns.tail(lookback)
     total_value = float(positions_df["Value"].sum())
     result: dict = {}
     for conf in [0.90, 0.95, 0.99]:
@@ -275,12 +314,14 @@ def calc_position_var(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     confidence: float = 0.95,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> dict:
     """1-Day VaR per individual position."""
     if price_df.empty or positions_df.empty:
         return {}
-    returns = price_df.pct_change().dropna().tail(lookback)
+    returns = price_df.pct_change().dropna()
+    if lookback:
+        returns = returns.tail(lookback)
     result: dict = {}
     for _, row in positions_df.iterrows():
         t = row["Ticker"]
@@ -298,17 +339,19 @@ def calc_marginal_risk_contribution(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     confidence: float = 0.95,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> dict:
     """% of total portfolio risk attributed to each position (marginal CVaR)."""
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return {}
 
-    port_tail_window = port_returns.tail(lookback)
+    port_tail_window = port_returns.tail(lookback) if lookback else port_returns
     threshold = float(np.percentile(port_tail_window, (1 - confidence) * 100))
 
-    returns = price_df.pct_change().dropna().tail(lookback)
+    returns = price_df.pct_change().dropna()
+    if lookback:
+        returns = returns.tail(lookback)
     tickers = [t for t in positions_df["Ticker"].tolist() if t in returns.columns]
     if not tickers:
         return {}
@@ -364,13 +407,13 @@ def calc_annualized_volatility(
 def calc_ulcer_index(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> float | None:
     """sqrt(mean(drawdown_pct^2)). Measures depth + duration of drawdowns."""
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return None
-    pr = port_returns.tail(lookback)
+    pr = port_returns.tail(lookback) if lookback else port_returns
     cum = (1 + pr).cumprod()
     dd_pct = (cum / cum.expanding().max() - 1) * 100
     return float(np.sqrt((dd_pct ** 2).mean()))
@@ -380,13 +423,13 @@ def calc_pain_ratio(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     risk_free_rate: float = 0.05,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> float | None:
     """(Annualized Return - RFR) / Ulcer Index."""
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return None
-    pr = port_returns.tail(lookback)
+    pr = port_returns.tail(lookback) if lookback else port_returns
     ulcer = calc_ulcer_index(price_df, positions_df, lookback)
     if ulcer is None or ulcer == 0:
         return None
@@ -399,13 +442,13 @@ def calc_omega_ratio(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
     threshold: float = 0.0,
-    lookback: int = 252,
+    lookback: int | None = None,
 ) -> float | None:
     """Probability-weighted ratio of gains to losses relative to threshold."""
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return None
-    pr = port_returns.tail(lookback)
+    pr = port_returns.tail(lookback) if lookback else port_returns
     daily_thresh = threshold / 252
     gains  = (pr[pr > daily_thresh]  - daily_thresh).sum()
     losses = (daily_thresh - pr[pr <= daily_thresh]).sum()
@@ -437,9 +480,12 @@ def calc_sortino_ratio(
     if port_returns is None or len(port_returns) < 30:
         return None
     daily_mar = risk_free_rate / 252
-    ann_return = (1 + port_returns.mean()) ** 252 - 1
-    downside = port_returns[port_returns < daily_mar] - daily_mar
-    downside_dev = np.sqrt((downside ** 2).mean()) * np.sqrt(252)
+    n_years = max(len(port_returns) / 252, 1e-9)
+    ann_return = float((1 + port_returns).prod() ** (1 / n_years) - 1)   # geometric
+    # Standard Sortino: downside deviation over ALL observations, min(r - MAR, 0);
+    # dividing by only the downside-day count overstates it (understates the ratio).
+    downside = (port_returns - daily_mar).clip(upper=0)
+    downside_dev = float(np.sqrt((downside ** 2).mean()) * np.sqrt(252))
     return float((ann_return - risk_free_rate) / downside_dev) if downside_dev else None
 
 
@@ -468,7 +514,8 @@ def calc_treynor_ratio(
     port_returns = _portfolio_daily_returns(price_df, positions_df)
     if port_returns is None or len(port_returns) < 30:
         return None
-    ann_return = (1 + port_returns.mean()) ** 252 - 1
+    n_years = max(len(port_returns) / 252, 1e-9)
+    ann_return = float((1 + port_returns).prod() ** (1 / n_years) - 1)   # geometric
     return float((ann_return - risk_free_rate) / port_beta)
 
 
@@ -661,6 +708,7 @@ def calc_stress_tests(positions_df: pd.DataFrame) -> pd.DataFrame:
         port_pnl = sum(
             float(r["Beta"]) * mkt_ret * float(r["Value"])
             for _, r in positions_df.iterrows()
+            if pd.notna(r["Beta"])   # unknown beta → excluded, not assumed = 1.0
         )
         rows.append({
             "Scenario":               name,

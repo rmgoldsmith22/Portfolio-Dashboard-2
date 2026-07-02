@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import html
 import io
 import math
 import pathlib
@@ -40,6 +41,7 @@ from calculations import (
     calc_sharpe_ratio,
     calc_sortino_ratio,
     calc_stress_tests,
+    calc_ticker_betas,
     calc_treynor_ratio,
     calc_ulcer_index,
     calc_var,
@@ -515,6 +517,7 @@ def cached_ticker_info(ticker: str) -> dict:
 
 try:
     from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 16_000_000  # decompression bombs raise instead of warn
     _HAS_PIL = True
 except Exception:  # Pillow not installed → skip color extraction, use fallback
     _HAS_PIL = False
@@ -534,6 +537,7 @@ BRAND_COLORS: dict[str, str] = {
     "QQQ": "#6f42c1", "SPY": "#1d6fa5", "VOO": "#96281B", "VTI": "#9b1b30",
 }
 _FALLBACK_BRAND = "#5f6b7a"
+_MAX_LOGO_BYTES = 512 * 1024  # cap fetched logo size (memory + page-weight guard)
 
 
 def _dominant_color(img_bytes: bytes) -> str | None:
@@ -581,17 +585,27 @@ def brand_logo_and_color(ticker: str, website: str | None) -> tuple[str | None, 
 
     for url in sources:
         try:
-            resp = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200 or not resp.content or len(resp.content) < 200:
+            # No redirects (SSRF guard); streamed with a hard size cap (DoS guard).
+            resp = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"},
+                                allow_redirects=False, stream=True)
+            if resp.status_code != 200:
                 continue
             ctype = resp.headers.get("Content-Type", "")
             if "image" not in ctype:
                 continue
-            color = _dominant_color(resp.content) or fallback
+            content = b""
+            for chunk in resp.iter_content(64 * 1024):
+                content += chunk
+                if len(content) > _MAX_LOGO_BYTES:
+                    content = b""
+                    break
+            if len(content) < 200:
+                continue
+            color = _dominant_color(content) or fallback
             mime = "image/png" if "png" in ctype else ("image/svg+xml" if "svg" in ctype else "image/jpeg")
             if "svg" in mime:   # can't recolor/extract reliably from SVG; use as image only
                 color = BRAND_COLORS.get(ticker.upper(), color)
-            b64 = base64.b64encode(resp.content).decode("ascii")
+            b64 = base64.b64encode(content).decode("ascii")
             return f"data:{mime};base64,{b64}", color
         except Exception:
             continue
@@ -641,7 +655,7 @@ def cached_benchmark_history(period: str, interval: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def cached_monte_carlo(
     price_df: pd.DataFrame,
     positions_df: pd.DataFrame,
@@ -708,6 +722,11 @@ with st.sidebar:
         "Inflation Rate (%)", 0.0, 8.0, 3.0, 0.5,
         help="Used for inflation-adjusted (real) projected values.",
     )
+    mc_use_hist = st.checkbox(
+        "Use historical mean return",
+        help="Ignore the Expected Return slider and use the portfolio's own "
+             "historical mean (still capped at 15%).",
+    )
 
     st.markdown("---")
     st.caption("Data: Yahoo Finance · Cache: 5 min")
@@ -715,6 +734,11 @@ with st.sidebar:
 # ── Resolve portfolio data ────────────────────────────────────────────────────
 
 st.title("Portfolio Risk Dashboard")
+st.caption(
+    "Methodology: historical risk metrics apply today's portfolio weights across the "
+    "entire lookback window (constant-weight backtest) — they describe the current mix, "
+    "not your realized returns."
+)
 
 # Timeframe dropdown — label sits to the left of the select
 tf_label_col, tf_select_col, _tf_spacer = st.columns([1, 2, 7])
@@ -737,7 +761,7 @@ _SHARES_KEYS   = ("qty", "quantity", "shares", "units")
 _AVGCOST_KEYS  = ("avg cost", "average cost", "cost/share", "cost per share",
                   "avg price", "average price")
 _COSTBASIS_KEYS = ("cost basis", "total cost")
-_NONPOSITION_RE = r"TOTAL|CASH|ACCOUNT|SUBTOTAL|^--$"
+_NONPOSITION_RE = r"^(CASH|--)$|TOTAL|ACCOUNT"  # anchored CASH: only exact footer rows match
 
 
 def _clean_number(x) -> float | None:
@@ -807,9 +831,15 @@ def normalize_portfolio_csv(source) -> pd.DataFrame:
 
     # Drop cash / totals / blank rows and anything without usable numbers.
     bad = out["Ticker"].str.contains(_NONPOSITION_RE, case=False, regex=True, na=True)
+    # Security: strict ticker whitelist blocks HTML/script payloads at the source
+    # (tickers later reach st.markdown(..., unsafe_allow_html=True) render paths).
+    bad |= ~out["Ticker"].str.fullmatch(r"[A-Z0-9.\-^=]{1,12}", na=False)
     out = out[~bad].dropna(subset=["Shares", "Avg_Cost"])
     out = out[out["Shares"] != 0]
-    return out.reset_index(drop=True)
+    out = out.reset_index(drop=True)
+    if len(out) > 200:
+        raise ValueError(f"{len(out)} positions found — limit is 200 rows.")
+    return out
 
 
 portfolio_df: pd.DataFrame | None = None
@@ -861,7 +891,13 @@ for t in active_df["Ticker"].tolist():
         if not last.empty:
             ticker_info.setdefault(t, {})["current_price"] = float(last.iloc[-1])
 
-positions = build_positions(active_df, ticker_info)
+_bench_returns: pd.Series | None = None
+if not bench_df.empty and PRIMARY_BENCH in bench_df.columns:
+    _bench_returns = bench_df[PRIMARY_BENCH].pct_change().dropna()
+
+# Betas from this window's actual price history (fallback inside: Yahoo's beta)
+ticker_betas = calc_ticker_betas(price_df, _bench_returns)
+positions = build_positions(active_df, ticker_info, ticker_betas)
 if positions.empty:
     st.error("Could not build positions — verify tickers have valid prices.")
     st.stop()
@@ -932,9 +968,7 @@ else:
     pos_var = {}
     mrc = {}
 
-primary_bench_returns: pd.Series | None = None
-if not bench_df.empty and PRIMARY_BENCH in bench_df.columns:
-    primary_bench_returns = bench_df[PRIMARY_BENCH].pct_change().dropna()
+primary_bench_returns: pd.Series | None = _bench_returns
 
 bench_stats = {"alpha": None, "r2": None, "tracking_error": None}
 up_cap = down_cap = info_ratio = None
@@ -1224,6 +1258,7 @@ with tab_overview:
         rows_html: list[str] = []
         for _, prow in alloc.iterrows():
             tkr = prow["Ticker"]
+            tkr_html = html.escape(str(tkr))  # defense-in-depth for unsafe_allow_html
             wt = float(prow["Value"]) / alloc_total * 100
             info = ticker_info.get(tkr) or {}
             logo_uri, color = brand_logo_and_color(tkr, info.get("website"))
@@ -1232,7 +1267,7 @@ with tab_overview:
             bar_w = max(4.0, wt / max_wt * 100)   # scale to largest; keep tiny ones visible
 
             if logo_uri:
-                icon = (f"<img src='{logo_uri}' alt='{tkr}' style='width:26px;height:26px;"
+                icon = (f"<img src='{logo_uri}' alt='{tkr_html}' style='width:26px;height:26px;"
                         f"object-fit:contain;border-radius:5px;background:#fff;"
                         f"border:0.5px solid #eee;flex:none;'/>")
             else:
@@ -1243,7 +1278,7 @@ with tab_overview:
                 "<div style='display:flex;align-items:center;gap:10px;padding:6px 0;"
                 "border-bottom:0.5px solid #eee;'>"
                 f"{icon}"
-                f"<div style='width:52px;flex:none;font-weight:600;font-size:13px;color:#1a1a1a;'>{tkr}</div>"
+                f"<div style='width:52px;flex:none;font-weight:600;font-size:13px;color:#1a1a1a;'>{tkr_html}</div>"
                 "<div style='flex:1;background:#f1f1ee;border-radius:5px;height:18px;min-width:30px;'>"
                 f"<div style='width:{bar_w:.1f}%;background:{color};height:100%;border-radius:5px;'></div></div>"
                 f"<div style='width:46px;flex:none;text-align:right;font-weight:600;font-size:13px;"
@@ -1268,7 +1303,7 @@ with tab_overview:
         fig_sec = go.Figure()
         fig_sec.add_trace(go.Bar(
             name="Portfolio", x=sec_merged["Portfolio %"], y=sec_merged["Sector"],
-            orientation="h", marker_color="#2a78d6",
+            orientation="h", marker_color="#1a1a1a",
             text=sec_merged["Portfolio %"].apply(lambda v: f"{v:.1f}%"), textposition="outside",
             textfont=dict(color="#3d3d3a"),
         ))
@@ -1315,244 +1350,243 @@ with tab_risk:
     if is_short_period:
         _short_period_notice()
         st.markdown(DISCLAIMER)
-        st.stop()
-
-    # ── Down Capture alert ────────────────────────────────────────────────────
-    if down_cap is not None:
-        mkt_fall = 10
-        port_fall = round(down_cap / 100 * mkt_fall, 1)
-        if down_cap > 100:
-            st.markdown(
-                f"<div class='badge badge-red'>Amplifies market downturns</div>  "
-                f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell "
-                f"<b>{port_fall}%</b>.</span>",
-                unsafe_allow_html=True,
-            )
-        elif down_cap > 90:
-            st.markdown(
-                f"<div class='badge badge-yellow'>Limited downside protection</div>  "
-                f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell "
-                f"<b>{port_fall}%</b>.</span>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div class='badge badge-green'>Good downside protection</div>  "
-                f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell only "
-                f"<b>{port_fall}%</b>.</span>",
-                unsafe_allow_html=True,
-            )
-        st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Risk metric cards ─────────────────────────────────────────────────────
-    r1, r2, r3, r4 = st.columns(4)
-
-    cvar_val = cvar_data.get("cvar_1d")
-    cvar_pct = cvar_data.get("cvar_1d_pct")
-    if cvar_val and cvar_pct:
-        r1.metric("CVaR (95%)", f"${cvar_val:,.0f}",
-                  f"Worst-5%-day avg: {cvar_pct:.2f}%",
-                  delta_color="inverse", help=HELP["cvar"])
     else:
-        r1.metric("CVaR (95%)", "N/A")
-
-    r2.metric("Calmar Ratio",  _fmt(calmar,  ".2f"), help=HELP["calmar"])
-    r3.metric("Treynor Ratio", _fmt(treynor, ".2f"), help=HELP["treynor"])
-    r4.metric(f"Sharpe ({period_label})", _fmt(sharpe, ".2f"),
-              help=HELP["sharpe"] + f"\n\n*Based on {lookback_days}-day lookback.*")
-
-    r5, r6, r7, r8 = st.columns(4)
-    r5.metric("Ulcer Index", _fmt(ulcer, ".2f"),
-              "Low (<5)" if (ulcer and ulcer < 5) else
-              ("Moderate (5–15)" if (ulcer and ulcer < 15) else "High (>15)"),
-              delta_color="inverse", help=HELP["ulcer"])
-    r6.metric("Pain Ratio",  _fmt(pain,  ".2f"), help=HELP["pain_ratio"])
-    r7.metric("Omega Ratio", _fmt(omega, ".2f"), help=HELP["omega"])
-    r8.metric("Annualised Volatility",
-              f"{ann_vol * 100:.2f}%" if ann_vol else "N/A", help=HELP["ann_vol"])
-
-    st.divider()
-
-    # ── Beta gauge + VaR multi-confidence ────────────────────────────────────
-    col_gauge, col_var = st.columns(2)
-
-    with col_gauge:
-        st.subheader("Portfolio Beta")
-        gauge_max = max(3.0, round(port_beta * 1.6, 1))
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number+delta",
-            value=port_beta,
-            delta={"reference": 1.0, "suffix": " vs market"},
-            number={"font": {"size": 44, "color": APPLE_WHITE}},
-            gauge={
-                "axis": {"range": [0, gauge_max], "tickcolor": APPLE_GRAY},
-                "bar":  {"color": APPLE_WHITE, "thickness": 0.3},
-                "steps": [
-                    {"range": [0, 0.5],      "color": "#d6ecdd"},
-                    {"range": [0.5, 1.0],    "color": "#e9f5ed"},
-                    {"range": [1.0, 1.5],    "color": "#fcf3d9"},
-                    {"range": [1.5, gauge_max], "color": "#fbe9e9"},
-                ],
-                "threshold": {"line": {"color": APPLE_WHITE, "width": 3},
-                              "thickness": 0.75, "value": 1.0},
-            },
-        ))
-        fig_gauge.update_layout(
-            height=280, paper_bgcolor="rgba(0,0,0,0)", font_color=APPLE_GRAY,
-            margin=dict(t=20, b=10, l=30, r=30),
-            annotations=[
-                dict(x=0.1, y=0.08, text="Defensive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                dict(x=0.38, y=0.08, text="Conservative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                dict(x=0.65, y=0.08, text="Aggressive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-                dict(x=0.90, y=0.08, text="Speculative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
-            ],
-        )
-        st.plotly_chart(fig_gauge, use_container_width=True)
-        st.caption("Beta = 1.0 means market-level risk — not low risk. Values > 1.5 amplify both gains and losses.")
-
-    with col_var:
-        st.subheader("VaR & CVaR — Confidence Levels")
-        if var_multi:
-            var_df = pd.DataFrame([
-                {"Level": "90%", "VaR ($)": var_multi.get("var_90"), "CVaR ($)": var_multi.get("cvar_90")},
-                {"Level": "95%", "VaR ($)": var_multi.get("var_95"), "CVaR ($)": var_multi.get("cvar_95")},
-                {"Level": "99%", "VaR ($)": var_multi.get("var_99"), "CVaR ($)": var_multi.get("cvar_99")},
-            ]).dropna()
-            fig_vm = go.Figure()
-            fig_vm.add_trace(go.Bar(name="VaR",  x=var_df["Level"], y=var_df["VaR ($)"],
-                                    marker_color=APPLE_WHITE,
-                                    text=var_df["VaR ($)"].apply(lambda v: f"${v:,.0f}"),
-                                    textposition="outside"))
-            fig_vm.add_trace(go.Bar(name="CVaR", x=var_df["Level"], y=var_df["CVaR ($)"],
-                                    marker_color=APPLE_RED,
-                                    text=var_df["CVaR ($)"].apply(lambda v: f"${v:,.0f}"),
-                                    textposition="outside"))
-            fig_vm.update_layout(barmode="group", yaxis_title="Expected Loss ($)",
-                                 showlegend=True, legend=dict(orientation="h", y=1.1))
-            _dark_chart(fig_vm, 280)
-            st.plotly_chart(fig_vm, use_container_width=True)
-
-    st.divider()
-
-    # ── Tail Risk histogram ───────────────────────────────────────────────────
-    st.subheader("Daily Return Distribution")
-    from calculations import _portfolio_daily_returns as _pdr
-    port_ret_series = _pdr(pdf, positions)
-    if port_ret_series is not None and len(port_ret_series) >= 30:
-        var_thresh = -var_data["var_1d_pct"] / 100 if var_data["var_1d_pct"] else None
-        cvar_thresh = -cvar_data["cvar_1d_pct"] / 100 if cvar_data["cvar_1d_pct"] else None
-        ret_vals = port_ret_series.dropna().values * 100
-        fig_hist = go.Figure()
-        fig_hist.add_trace(go.Histogram(x=ret_vals, nbinsx=60, name="Daily Returns",
-                                        marker_color="#bdbdb7", opacity=0.85))
-        if var_thresh is not None:
-            tail_vals = ret_vals[ret_vals <= var_thresh * 100]
-            fig_hist.add_trace(go.Histogram(x=tail_vals, nbinsx=20, name="Worst 5%",
-                                            marker_color=APPLE_RED, opacity=0.9))
-            fig_hist.add_vline(x=var_thresh * 100, line_dash="dash", line_color=APPLE_WHITE,
-                               annotation_text=f"VaR 95%: {var_thresh * 100:.2f}%",
-                               annotation_position="top right")
-        if cvar_thresh is not None:
-            fig_hist.add_vline(x=cvar_thresh * 100, line_dash="dot", line_color=APPLE_RED,
-                               annotation_text=f"CVaR 95%: {cvar_thresh * 100:.2f}%",
-                               annotation_position="top left")
-        fig_hist.update_layout(xaxis_title="Daily Return (%)", yaxis_title="Frequency",
-                               barmode="overlay", showlegend=True,
-                               legend=dict(orientation="h", y=1.05))
-        _dark_chart(fig_hist, 280)
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-    # ── Stress tests ──────────────────────────────────────────────────────────
-    st.subheader("Stress Test Scenarios")
-    if not stress_df.empty:
-        for _, srow in stress_df.iterrows():
-            pct = float(srow["Est. Portfolio Loss (%)"])
-            val = float(srow["Est. Portfolio Loss ($)"])
-            if pct < -30:
-                badge_cls = "badge badge-red"
-                badge_text = "SEVERE"
-            elif pct < -15:
-                badge_cls = "badge badge-yellow"
-                badge_text = "ELEVATED"
+        # ── Down Capture alert ────────────────────────────────────────────────────
+        if down_cap is not None:
+            mkt_fall = 10
+            port_fall = round(down_cap / 100 * mkt_fall, 1)
+            if down_cap > 100:
+                st.markdown(
+                    f"<div class='badge badge-red'>Amplifies market downturns</div>  "
+                    f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell "
+                    f"<b>{port_fall}%</b>.</span>",
+                    unsafe_allow_html=True,
+                )
+            elif down_cap > 90:
+                st.markdown(
+                    f"<div class='badge badge-yellow'>Limited downside protection</div>  "
+                    f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell "
+                    f"<b>{port_fall}%</b>.</span>",
+                    unsafe_allow_html=True,
+                )
             else:
-                badge_cls = "badge badge-gray"
-                badge_text = "MODERATE"
-            st.markdown(
-                f"<div style='margin: 8px 0'>"
-                f"<span class='{badge_cls}'>{badge_text}</span>  "
-                f"<b style='color:{APPLE_WHITE}'>{srow['Scenario']}</b>  "
-                f"<span style='color:{APPLE_GRAY}'>(Market: {srow['Market Shock']})</span> — "
-                f"Est. loss: <b style='color:{APPLE_RED if pct < 0 else APPLE_WHITE}'>${val:,.0f}</b> "
-                f"<span style='color:{APPLE_GRAY}'>({pct:.1f}%)</span>"
-                f"</div>",
-                unsafe_allow_html=True,
+                st.markdown(
+                    f"<div class='badge badge-green'>Good downside protection</div>  "
+                    f"<span style='color:{APPLE_WHITE}'>When the S&P 500 falls {mkt_fall}%, this portfolio historically fell only "
+                    f"<b>{port_fall}%</b>.</span>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Risk metric cards ─────────────────────────────────────────────────────
+        r1, r2, r3, r4 = st.columns(4)
+
+        cvar_val = cvar_data.get("cvar_1d")
+        cvar_pct = cvar_data.get("cvar_1d_pct")
+        if cvar_val is not None and cvar_pct is not None:
+            r1.metric("CVaR (95%)", f"${cvar_val:,.0f}",
+                      f"Worst-5%-day avg: {cvar_pct:.2f}%",
+                      delta_color="inverse", help=HELP["cvar"])
+        else:
+            r1.metric("CVaR (95%)", "N/A")
+
+        r2.metric("Calmar Ratio",  _fmt(calmar,  ".2f"), help=HELP["calmar"])
+        r3.metric("Treynor Ratio", _fmt(treynor, ".2f"), help=HELP["treynor"])
+        r4.metric(f"Sharpe ({period_label})", _fmt(sharpe, ".2f"),
+                  help=HELP["sharpe"] + f"\n\n*Based on {lookback_days}-day lookback.*")
+
+        r5, r6, r7, r8 = st.columns(4)
+        r5.metric("Ulcer Index", _fmt(ulcer, ".2f"),
+                  "Low (<5)" if (ulcer and ulcer < 5) else
+                  ("Moderate (5–15)" if (ulcer and ulcer < 15) else "High (>15)"),
+                  delta_color="inverse", help=HELP["ulcer"])
+        r6.metric("Pain Ratio",  _fmt(pain,  ".2f"), help=HELP["pain_ratio"])
+        r7.metric("Omega Ratio", _fmt(omega, ".2f"), help=HELP["omega"])
+        r8.metric("Annualised Volatility",
+                  f"{ann_vol * 100:.2f}%" if ann_vol else "N/A", help=HELP["ann_vol"])
+
+        st.divider()
+
+        # ── Beta gauge + VaR multi-confidence ────────────────────────────────────
+        col_gauge, col_var = st.columns(2)
+
+        with col_gauge:
+            st.subheader("Portfolio Beta")
+            gauge_max = max(3.0, round(port_beta * 1.6, 1))
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=port_beta,
+                delta={"reference": 1.0, "suffix": " vs market"},
+                number={"font": {"size": 44, "color": APPLE_WHITE}},
+                gauge={
+                    "axis": {"range": [0, gauge_max], "tickcolor": APPLE_GRAY},
+                    "bar":  {"color": APPLE_WHITE, "thickness": 0.3},
+                    "steps": [
+                        {"range": [0, 0.5],      "color": "#d6ecdd"},
+                        {"range": [0.5, 1.0],    "color": "#e9f5ed"},
+                        {"range": [1.0, 1.5],    "color": "#fcf3d9"},
+                        {"range": [1.5, gauge_max], "color": "#fbe9e9"},
+                    ],
+                    "threshold": {"line": {"color": APPLE_WHITE, "width": 3},
+                                  "thickness": 0.75, "value": 1.0},
+                },
+            ))
+            fig_gauge.update_layout(
+                height=280, paper_bgcolor="rgba(0,0,0,0)", font_color=APPLE_GRAY,
+                margin=dict(t=20, b=10, l=30, r=30),
+                annotations=[
+                    dict(x=0.1, y=0.08, text="Defensive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.38, y=0.08, text="Conservative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.65, y=0.08, text="Aggressive", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                    dict(x=0.90, y=0.08, text="Speculative", showarrow=False, font=dict(size=9, color=APPLE_GRAY)),
+                ],
             )
+            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.caption("Beta = 1.0 means market-level risk — not low risk. Values > 1.5 amplify both gains and losses.")
 
-    st.divider()
+        with col_var:
+            st.subheader("VaR & CVaR — Confidence Levels")
+            if var_multi:
+                var_df = pd.DataFrame([
+                    {"Level": "90%", "VaR ($)": var_multi.get("var_90"), "CVaR ($)": var_multi.get("cvar_90")},
+                    {"Level": "95%", "VaR ($)": var_multi.get("var_95"), "CVaR ($)": var_multi.get("cvar_95")},
+                    {"Level": "99%", "VaR ($)": var_multi.get("var_99"), "CVaR ($)": var_multi.get("cvar_99")},
+                ]).dropna()
+                fig_vm = go.Figure()
+                fig_vm.add_trace(go.Bar(name="VaR",  x=var_df["Level"], y=var_df["VaR ($)"],
+                                        marker_color=APPLE_WHITE,
+                                        text=var_df["VaR ($)"].apply(lambda v: f"${v:,.0f}"),
+                                        textposition="outside"))
+                fig_vm.add_trace(go.Bar(name="CVaR", x=var_df["Level"], y=var_df["CVaR ($)"],
+                                        marker_color=APPLE_RED,
+                                        text=var_df["CVaR ($)"].apply(lambda v: f"${v:,.0f}"),
+                                        textposition="outside"))
+                fig_vm.update_layout(barmode="group", yaxis_title="Expected Loss ($)",
+                                     showlegend=True, legend=dict(orientation="h", y=1.1))
+                _dark_chart(fig_vm, 280)
+                st.plotly_chart(fig_vm, use_container_width=True)
 
-    # ── Rolling charts ────────────────────────────────────────────────────────
-    if not rolling.empty:
-        col_rs, col_rv = st.columns(2)
-        with col_rs:
-            st.subheader("Rolling Sharpe (90d)")
-            fig_rs = go.Figure(go.Scatter(
-                x=rolling.index, y=rolling["Rolling Sharpe"],
-                line=dict(color=APPLE_WHITE, width=1.8), fill="tozeroy",
-                fillcolor="rgba(0,0,0,0.06)",
-                hovertemplate="%{y:.2f}<extra></extra>",
+        st.divider()
+
+        # ── Tail Risk histogram ───────────────────────────────────────────────────
+        st.subheader("Daily Return Distribution")
+        from calculations import _portfolio_daily_returns as _pdr
+        port_ret_series = _pdr(pdf, positions)
+        if port_ret_series is not None and len(port_ret_series) >= 30:
+            var_thresh = -var_data["var_1d_pct"] / 100 if var_data["var_1d_pct"] else None
+            cvar_thresh = -cvar_data["cvar_1d_pct"] / 100 if cvar_data["cvar_1d_pct"] else None
+            ret_vals = port_ret_series.dropna().values * 100
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(x=ret_vals, nbinsx=60, name="Daily Returns",
+                                            marker_color="#bdbdb7", opacity=0.85))
+            if var_thresh is not None:
+                tail_vals = ret_vals[ret_vals <= var_thresh * 100]
+                fig_hist.add_trace(go.Histogram(x=tail_vals, nbinsx=20, name="Worst 5%",
+                                                marker_color=APPLE_RED, opacity=0.9))
+                fig_hist.add_vline(x=var_thresh * 100, line_dash="dash", line_color=APPLE_WHITE,
+                                   annotation_text=f"VaR 95%: {var_thresh * 100:.2f}%",
+                                   annotation_position="top right")
+            if cvar_thresh is not None:
+                fig_hist.add_vline(x=cvar_thresh * 100, line_dash="dot", line_color=APPLE_RED,
+                                   annotation_text=f"CVaR 95%: {cvar_thresh * 100:.2f}%",
+                                   annotation_position="top left")
+            fig_hist.update_layout(xaxis_title="Daily Return (%)", yaxis_title="Frequency",
+                                   barmode="overlay", showlegend=True,
+                                   legend=dict(orientation="h", y=1.05))
+            _dark_chart(fig_hist, 280)
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        # ── Stress tests ──────────────────────────────────────────────────────────
+        st.subheader("Stress Test Scenarios")
+        if not stress_df.empty:
+            for _, srow in stress_df.iterrows():
+                pct = float(srow["Est. Portfolio Loss (%)"])
+                val = float(srow["Est. Portfolio Loss ($)"])
+                if pct < -30:
+                    badge_cls = "badge badge-red"
+                    badge_text = "SEVERE"
+                elif pct < -15:
+                    badge_cls = "badge badge-yellow"
+                    badge_text = "ELEVATED"
+                else:
+                    badge_cls = "badge badge-gray"
+                    badge_text = "MODERATE"
+                st.markdown(
+                    f"<div style='margin: 8px 0'>"
+                    f"<span class='{badge_cls}'>{badge_text}</span>  "
+                    f"<b style='color:{APPLE_WHITE}'>{srow['Scenario']}</b>  "
+                    f"<span style='color:{APPLE_GRAY}'>(Market: {srow['Market Shock']})</span> — "
+                    f"Est. loss: <b style='color:{APPLE_RED if pct < 0 else APPLE_WHITE}'>${val:,.0f}</b> "
+                    f"<span style='color:{APPLE_GRAY}'>({pct:.1f}%)</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ── Rolling charts ────────────────────────────────────────────────────────
+        if not rolling.empty:
+            col_rs, col_rv = st.columns(2)
+            with col_rs:
+                st.subheader("Rolling Sharpe (63d)")
+                fig_rs = go.Figure(go.Scatter(
+                    x=rolling.index, y=rolling["Rolling Sharpe"],
+                    line=dict(color=APPLE_WHITE, width=1.8), fill="tozeroy",
+                    fillcolor="rgba(0,0,0,0.06)",
+                    hovertemplate="%{y:.2f}<extra></extra>",
+                ))
+                fig_rs.add_hline(y=1.0, line_dash="dash", line_color=APPLE_GREEN,
+                                 annotation_text="1.0", annotation_position="top right")
+                fig_rs.add_hline(y=0.0, line_color=SUBTLE, line_width=0.5)
+                _dark_chart(fig_rs)
+                fig_rs.update_layout(yaxis_title="Sharpe")
+                st.plotly_chart(fig_rs, use_container_width=True)
+
+            with col_rv:
+                st.subheader("Rolling Volatility (63d, ann.)")
+                fig_rv = go.Figure(go.Scatter(
+                    x=rolling.index, y=rolling["Rolling Volatility (%)"],
+                    line=dict(color=APPLE_RED, width=1.8), fill="tozeroy",
+                    fillcolor="rgba(255,69,58,0.10)",
+                    hovertemplate="%{y:.1f}%<extra></extra>",
+                ))
+                _dark_chart(fig_rv)
+                fig_rv.update_layout(yaxis_title="Volatility (%)")
+                st.plotly_chart(fig_rv, use_container_width=True)
+
+        st.divider()
+
+        # ── Drawdown chart ────────────────────────────────────────────────────────
+        st.subheader("Drawdown from Rolling Peak")
+        if dd_series is not None and not dd_series.empty:
+            fig_dd = go.Figure(go.Scatter(
+                x=dd_series.index, y=dd_series * 100,
+                fill="tozeroy", fillcolor="rgba(255,69,58,0.18)",
+                line=dict(color=APPLE_RED, width=1.5),
+                hovertemplate="%{y:.2f}%<extra></extra>",
             ))
-            fig_rs.add_hline(y=1.0, line_dash="dash", line_color=APPLE_GREEN,
-                             annotation_text="1.0", annotation_position="top right")
-            fig_rs.add_hline(y=0.0, line_color=SUBTLE, line_width=0.5)
-            _dark_chart(fig_rs)
-            fig_rs.update_layout(yaxis_title="Sharpe")
-            st.plotly_chart(fig_rs, use_container_width=True)
+            fig_dd.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
+            _dark_chart(fig_dd, 220)
+            fig_dd.update_layout(yaxis_title="Drawdown (%)")
+            st.plotly_chart(fig_dd, use_container_width=True)
 
-        with col_rv:
-            st.subheader("Rolling Volatility (90d, ann.)")
-            fig_rv = go.Figure(go.Scatter(
-                x=rolling.index, y=rolling["Rolling Volatility (%)"],
-                line=dict(color=APPLE_RED, width=1.8), fill="tozeroy",
-                fillcolor="rgba(255,69,58,0.10)",
-                hovertemplate="%{y:.1f}%<extra></extra>",
+        # ── Correlation heatmap ───────────────────────────────────────────────────
+        if not corr.empty and corr.shape[0] > 1:
+            st.subheader("Return Correlation Matrix")
+            fig_corr = go.Figure(go.Heatmap(
+                z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(),
+                colorscale="RdYlGn_r", zmin=-1, zmax=1,
+                text=np.round(corr.values, 2), texttemplate="%{text:.2f}",
+                colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
             ))
-            _dark_chart(fig_rv)
-            fig_rv.update_layout(yaxis_title="Volatility (%)")
-            st.plotly_chart(fig_rv, use_container_width=True)
+            fig_corr.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)",
+                                   font_color=APPLE_GRAY, margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig_corr, use_container_width=True)
 
-    st.divider()
+        with st.expander("What do these metrics mean?"):
+            st.markdown(SECTION_EXPLAINERS["risk"])
 
-    # ── Drawdown chart ────────────────────────────────────────────────────────
-    st.subheader("Drawdown from Rolling Peak")
-    if dd_series is not None and not dd_series.empty:
-        fig_dd = go.Figure(go.Scatter(
-            x=dd_series.index, y=dd_series * 100,
-            fill="tozeroy", fillcolor="rgba(255,69,58,0.18)",
-            line=dict(color=APPLE_RED, width=1.5),
-            hovertemplate="%{y:.2f}%<extra></extra>",
-        ))
-        fig_dd.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
-        _dark_chart(fig_dd, 220)
-        fig_dd.update_layout(yaxis_title="Drawdown (%)")
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-    # ── Correlation heatmap ───────────────────────────────────────────────────
-    if not corr.empty and corr.shape[0] > 1:
-        st.subheader("Return Correlation Matrix")
-        fig_corr = go.Figure(go.Heatmap(
-            z=corr.values, x=corr.columns.tolist(), y=corr.index.tolist(),
-            colorscale="RdYlGn_r", zmin=-1, zmax=1,
-            text=np.round(corr.values, 2), texttemplate="%{text:.2f}",
-            colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1]),
-        ))
-        fig_corr.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)",
-                               font_color=APPLE_GRAY, margin=dict(t=10, b=10, l=10, r=10))
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-    with st.expander("What do these metrics mean?"):
-        st.markdown(SECTION_EXPLAINERS["risk"])
-
-    st.markdown(DISCLAIMER)
+        st.markdown(DISCLAIMER)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1564,116 +1598,115 @@ with tab_bench:
     if is_short_period:
         _short_period_notice()
         st.markdown(DISCLAIMER)
-        st.stop()
-
-    alpha = bench_stats.get("alpha")
-    r2    = bench_stats.get("r2")
-    te    = bench_stats.get("tracking_error")
-
-    b1, b2, b3 = st.columns(3)
-    b1.metric("Jensen's Alpha",  f"{alpha * 100:+.2f}%" if alpha is not None else "N/A",
-              "Above CAPM" if (alpha and alpha > 0) else "Below CAPM",
-              delta_color="normal" if (alpha and alpha > 0) else "inverse", help=HELP["alpha"])
-    b2.metric("R² vs S&P 500",  f"{r2 * 100:.1f}%" if r2 is not None else "N/A", help=HELP["r2"])
-    b3.metric("Tracking Error", f"{te * 100:.2f}%" if te is not None else "N/A", help=HELP["tracking_error"])
-
-    b4, b5, b6 = st.columns(3)
-    b4.metric("Up Capture", f"{up_cap:.1f}%" if up_cap is not None else "N/A",
-              "Captures upside" if (up_cap and up_cap > 100) else "Lags on rallies",
-              delta_color="normal" if (up_cap and up_cap > 100) else "inverse", help=HELP["up_capture"])
-    if down_cap is not None:
-        if down_cap > 100:   dc_delta, dc_color = "Amplifies losses", "inverse"
-        elif down_cap > 90:  dc_delta, dc_color = "Caution",           "off"
-        else:                dc_delta, dc_color = "Good protection",   "normal"
-        b5.metric("Down Capture", f"{down_cap:.1f}%", dc_delta, delta_color=dc_color, help=HELP["down_capture"])
     else:
-        b5.metric("Down Capture", "N/A")
-    b6.metric("Info Ratio", _fmt(info_ratio, ".2f"),
-              "Skilled active" if (info_ratio and info_ratio > 0.5) else
-              ("Marginal" if (info_ratio and info_ratio > 0) else "Lags benchmark"),
-              delta_color="normal" if (info_ratio and info_ratio > 0.5) else "inverse", help=HELP["info_ratio"])
+        alpha = bench_stats.get("alpha")
+        r2    = bench_stats.get("r2")
+        te    = bench_stats.get("tracking_error")
 
-    with st.expander("What do these metrics mean?"):
-        st.markdown(SECTION_EXPLAINERS["benchmarks"])
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Jensen's Alpha",  f"{alpha * 100:+.2f}%" if alpha is not None else "N/A",
+                  None if alpha is None else ("Above CAPM" if alpha > 0 else "Below CAPM"),
+                  delta_color="normal" if (alpha is not None and alpha > 0) else "inverse", help=HELP["alpha"])
+        b2.metric("R² vs S&P 500",  f"{r2 * 100:.1f}%" if r2 is not None else "N/A", help=HELP["r2"])
+        b3.metric("Tracking Error", f"{te * 100:.2f}%" if te is not None else "N/A", help=HELP["tracking_error"])
 
-    st.divider()
+        b4, b5, b6 = st.columns(3)
+        b4.metric("Up Capture", f"{up_cap:.1f}%" if up_cap is not None else "N/A",
+                  "Captures upside" if (up_cap and up_cap > 100) else "Lags on rallies",
+                  delta_color="normal" if (up_cap and up_cap > 100) else "inverse", help=HELP["up_capture"])
+        if down_cap is not None:
+            if down_cap > 100:   dc_delta, dc_color = "Amplifies losses", "inverse"
+            elif down_cap > 90:  dc_delta, dc_color = "Caution",           "off"
+            else:                dc_delta, dc_color = "Good protection",   "normal"
+            b5.metric("Down Capture", f"{down_cap:.1f}%", dc_delta, delta_color=dc_color, help=HELP["down_capture"])
+        else:
+            b5.metric("Down Capture", "N/A")
+        b6.metric("Info Ratio", _fmt(info_ratio, ".2f"),
+                  "Skilled active" if (info_ratio and info_ratio > 0.5) else
+                  ("Marginal" if (info_ratio and info_ratio > 0) else "Lags benchmark"),
+                  delta_color="normal" if (info_ratio and info_ratio > 0.5) else "inverse", help=HELP["info_ratio"])
 
-    # ── Rolling Beta & Correlation ────────────────────────────────────────────
-    if len(roll_beta_series) > 0 or len(roll_corr_series) > 0:
-        rb_col, rc_col = st.columns(2)
+        with st.expander("What do these metrics mean?"):
+            st.markdown(SECTION_EXPLAINERS["benchmarks"])
 
-        with rb_col:
-            st.subheader("Rolling Beta vs S&P 500 (90d)")
-            if len(roll_beta_series) > 0:
-                fig_rb = go.Figure(go.Scatter(
-                    x=roll_beta_series.index, y=roll_beta_series.values,
-                    line=dict(color=APPLE_WHITE, width=1.8),
-                    hovertemplate="%{y:.2f}<extra></extra>",
+        st.divider()
+
+        # ── Rolling Beta & Correlation ────────────────────────────────────────────
+        if len(roll_beta_series) > 0 or len(roll_corr_series) > 0:
+            rb_col, rc_col = st.columns(2)
+
+            with rb_col:
+                st.subheader("Rolling Beta vs S&P 500 (90d)")
+                if len(roll_beta_series) > 0:
+                    fig_rb = go.Figure(go.Scatter(
+                        x=roll_beta_series.index, y=roll_beta_series.values,
+                        line=dict(color=APPLE_WHITE, width=1.8),
+                        hovertemplate="%{y:.2f}<extra></extra>",
+                    ))
+                    fig_rb.add_hline(y=1.0, line_dash="dash", line_color=APPLE_GRAY,
+                                     annotation_text="Market β=1.0")
+                    _dark_chart(fig_rb)
+                    fig_rb.update_layout(yaxis_title="Rolling Beta", xaxis_title="Date")
+                    st.plotly_chart(fig_rb, use_container_width=True)
+
+            with rc_col:
+                st.subheader("Rolling Correlation vs S&P 500 (90d)")
+                if len(roll_corr_series) > 0:
+                    fig_rc = go.Figure(go.Scatter(
+                        x=roll_corr_series.index, y=roll_corr_series.values,
+                        line=dict(color=APPLE_BLUE, width=1.8),
+                        fill="tozeroy", fillcolor="rgba(0,0,0,0.06)",
+                        hovertemplate="%{y:.2f}<extra></extra>",
+                    ))
+                    fig_rc.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
+                    _dark_chart(fig_rc)
+                    fig_rc.update_layout(yaxis_title="Correlation (ρ)", xaxis_title="Date",
+                                         yaxis_range=[-1.1, 1.1])
+                    st.plotly_chart(fig_rc, use_container_width=True)
+
+        # ── Active Return bar chart ───────────────────────────────────────────────
+        st.subheader("Monthly Active Return vs S&P 500")
+        if port_cum is not None and not port_cum.empty and PRIMARY_BENCH in bench_df.columns:
+            from calculations import _portfolio_daily_returns as _pdr
+            pr = _pdr(pdf, positions)
+            if pr is not None:
+                bench_ret = bench_df[PRIMARY_BENCH].pct_change().dropna()
+                aligned = pd.DataFrame({"port": pr, "bench": bench_ret}).dropna()
+                aligned.index = pd.DatetimeIndex(aligned.index)
+                monthly = aligned.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+                monthly["active"] = monthly["port"] - monthly["bench"]
+                fig_ar = go.Figure(go.Bar(
+                    x=monthly.index, y=monthly["active"] * 100,
+                    marker_color=[APPLE_GREEN if v >= 0 else APPLE_RED for v in monthly["active"]],
+                    hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra></extra>",
                 ))
-                fig_rb.add_hline(y=1.0, line_dash="dash", line_color=APPLE_GRAY,
-                                 annotation_text="Market β=1.0")
-                _dark_chart(fig_rb)
-                fig_rb.update_layout(yaxis_title="Rolling Beta", xaxis_title="Date")
-                st.plotly_chart(fig_rb, use_container_width=True)
+                fig_ar.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
+                _dark_chart(fig_ar, 280)
+                fig_ar.update_layout(yaxis_title="Active Return (%)", xaxis_title="Date")
+                st.plotly_chart(fig_ar, use_container_width=True)
 
-        with rc_col:
-            st.subheader("Rolling Correlation vs S&P 500 (90d)")
-            if len(roll_corr_series) > 0:
-                fig_rc = go.Figure(go.Scatter(
-                    x=roll_corr_series.index, y=roll_corr_series.values,
-                    line=dict(color=APPLE_BLUE, width=1.8),
-                    fill="tozeroy", fillcolor="rgba(0,0,0,0.06)",
-                    hovertemplate="%{y:.2f}<extra></extra>",
-                ))
-                fig_rc.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
-                _dark_chart(fig_rc)
-                fig_rc.update_layout(yaxis_title="Correlation (ρ)", xaxis_title="Date",
-                                     yaxis_range=[-1.1, 1.1])
-                st.plotly_chart(fig_rc, use_container_width=True)
+        # ── Summary table ─────────────────────────────────────────────────────────
+        if alpha is not None:
+            st.markdown("#### Relative Performance Summary (vs S&P 500)")
+            summary_data = [
+                {"Metric": "Jensen's Alpha", "Value": f"{alpha * 100:+.2f}%",
+                 "Interpretation": "Above market expectation" if alpha > 0 else "Below market expectation"},
+                {"Metric": "R-Squared", "Value": f"{r2 * 100:.1f}%",
+                 "Interpretation": "Highly index-like" if r2 > 0.9 else ("Moderately correlated" if r2 > 0.6 else "Low benchmark correlation")},
+                {"Metric": "Tracking Error", "Value": f"{te * 100:.2f}%",
+                 "Interpretation": "Tight index tracking" if te < 0.03 else ("Active range" if te < 0.10 else "Highly active")},
+                {"Metric": "Up Capture", "Value": f"{up_cap:.1f}%" if up_cap else "N/A",
+                 "Interpretation": "Captures upside well" if (up_cap and up_cap > 100) else "Underperforms in rallies"},
+                {"Metric": "Down Capture", "Value": f"{down_cap:.1f}%" if down_cap else "N/A",
+                 "Interpretation": "Good downside protection" if (down_cap and down_cap < 90) else
+                 ("Limited protection" if (down_cap and down_cap < 100) else "Amplifies market losses")},
+                {"Metric": "Information Ratio", "Value": _fmt(info_ratio, ".2f"),
+                 "Interpretation": "Skilled active mgmt" if (info_ratio and info_ratio > 0.5) else
+                 ("Marginal active value" if (info_ratio and info_ratio > 0) else "Benchmark dominates")},
+            ]
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
 
-    # ── Active Return bar chart ───────────────────────────────────────────────
-    st.subheader("Monthly Active Return vs S&P 500")
-    if port_cum is not None and not port_cum.empty and PRIMARY_BENCH in bench_df.columns:
-        from calculations import _portfolio_daily_returns as _pdr
-        pr = _pdr(pdf, positions)
-        if pr is not None:
-            bench_ret = bench_df[PRIMARY_BENCH].pct_change().dropna()
-            aligned = pd.DataFrame({"port": pr, "bench": bench_ret}).dropna()
-            aligned.index = pd.DatetimeIndex(aligned.index)
-            monthly = aligned.resample("ME").apply(lambda x: (1 + x).prod() - 1)
-            monthly["active"] = monthly["port"] - monthly["bench"]
-            fig_ar = go.Figure(go.Bar(
-                x=monthly.index, y=monthly["active"] * 100,
-                marker_color=[APPLE_GREEN if v >= 0 else APPLE_RED for v in monthly["active"]],
-                hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra></extra>",
-            ))
-            fig_ar.add_hline(y=0, line_color=SUBTLE, line_width=0.5)
-            _dark_chart(fig_ar, 280)
-            fig_ar.update_layout(yaxis_title="Active Return (%)", xaxis_title="Date")
-            st.plotly_chart(fig_ar, use_container_width=True)
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    if alpha is not None:
-        st.markdown("#### Relative Performance Summary (vs S&P 500)")
-        summary_data = [
-            {"Metric": "Jensen's Alpha", "Value": f"{alpha * 100:+.2f}%",
-             "Interpretation": "Above market expectation" if alpha > 0 else "Below market expectation"},
-            {"Metric": "R-Squared", "Value": f"{r2 * 100:.1f}%",
-             "Interpretation": "Highly index-like" if r2 > 0.9 else ("Moderately correlated" if r2 > 0.6 else "Low benchmark correlation")},
-            {"Metric": "Tracking Error", "Value": f"{te * 100:.2f}%",
-             "Interpretation": "Tight index tracking" if te < 0.03 else ("Active range" if te < 0.10 else "Highly active")},
-            {"Metric": "Up Capture", "Value": f"{up_cap:.1f}%" if up_cap else "N/A",
-             "Interpretation": "Captures upside well" if (up_cap and up_cap > 100) else "Underperforms in rallies"},
-            {"Metric": "Down Capture", "Value": f"{down_cap:.1f}%" if down_cap else "N/A",
-             "Interpretation": "Good downside protection" if (down_cap and down_cap < 90) else
-             ("Limited protection" if (down_cap and down_cap < 100) else "Amplifies market losses")},
-            {"Metric": "Information Ratio", "Value": _fmt(info_ratio, ".2f"),
-             "Interpretation": "Skilled active mgmt" if (info_ratio and info_ratio > 0.5) else
-             ("Marginal active value" if (info_ratio and info_ratio > 0) else "Benchmark dominates")},
-        ]
-        st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
-
-    st.markdown(DISCLAIMER)
+        st.markdown(DISCLAIMER)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1718,7 +1751,7 @@ with tab_mc:
         help="Reverses historical return order to simulate worst-case timing.",
     )
 
-    mc_expected_return = mc_expected_return_pct / 100
+    mc_expected_return = None if mc_use_hist else mc_expected_return_pct / 100
     mc_inflation_rate  = mc_inflation_rate_pct / 100
 
     if is_short_period:
@@ -1900,13 +1933,13 @@ with tab_holdings:
         if row["Weight"] > 33:
             st.markdown(
                 f"<div style='margin: 6px 0'><span class='badge badge-red'>Over-Concentrated</span>  "
-                f"<b style='color:{APPLE_WHITE}'>{row['Ticker']}</b> is {row['Weight']:.1f}% — exceeds 33%.</div>",
+                f"<b style='color:{APPLE_WHITE}'>{html.escape(str(row['Ticker']))}</b> is {row['Weight']:.1f}% — exceeds 33%.</div>",
                 unsafe_allow_html=True,
             )
         elif row["Weight"] > 25:
             st.markdown(
                 f"<div style='margin: 6px 0'><span class='badge badge-yellow'>Caution</span>  "
-                f"<b style='color:{APPLE_WHITE}'>{row['Ticker']}</b> is {row['Weight']:.1f}% — exceeds 25%.</div>",
+                f"<b style='color:{APPLE_WHITE}'>{html.escape(str(row['Ticker']))}</b> is {row['Weight']:.1f}% — exceeds 25%.</div>",
                 unsafe_allow_html=True,
             )
 
@@ -1930,13 +1963,13 @@ with tab_holdings:
             else:
                 badge_cls, badge_lbl = "badge badge-green",  "Near High"
             st.markdown(
-                f"<b style='color:{APPLE_WHITE}'>{row['Ticker']}</b>  "
+                f"<b style='color:{APPLE_WHITE}'>{html.escape(str(row['Ticker']))}</b>  "
                 f"<span style='color:{APPLE_GRAY}'>${price:.2f}  ·  "
                 f"Low ${lo:.2f}  ·  High ${hi:.2f}</span>  "
                 f"<span class='{badge_cls}'>{badge_lbl}</span>",
                 unsafe_allow_html=True,
             )
-            st.progress(int(pos_pct))
+            st.progress(int(min(100, max(0, pos_pct))))
 
     st.divider()
 
@@ -1968,7 +2001,7 @@ with tab_holdings:
         x=beta_df["Ticker"], y=beta_df["Beta_Contribution"],
         marker=dict(color=beta_df["Beta"].astype(float), colorscale="RdYlGn_r",
                     showscale=True, colorbar=dict(title="Raw β", tickfont=dict(color=APPLE_GRAY))),
-        text=beta_df["Beta_Contribution"].apply(lambda v: f"{v:.3f}"), textposition="outside",
+        text=beta_df["Beta_Contribution"].apply(lambda v: f"{v:.3f}" if pd.notna(v) else "—"), textposition="outside",
     ))
     fig_beta.add_hline(y=port_beta, line_dash="dash", line_color=APPLE_GRAY,
                        annotation_text=f"Portfolio β = {port_beta:.2f}", annotation_position="top right")
@@ -2000,7 +2033,7 @@ with tab_holdings:
             "Ulcer Index":              _fmt(ulcer,   ".2f"),
             "Pain Ratio":               _fmt(pain,    ".2f"),
             "Omega Ratio":              _fmt(omega,   ".2f"),
-            "Max Drawdown":             f"{max_dd * 100:.2f}%" if max_dd else "N/A",
+            "Max Drawdown":             f"{max_dd * 100:.2f}%" if max_dd is not None else "N/A",
             "Annualised Volatility":    f"{ann_vol * 100:.2f}%" if ann_vol else "N/A",
             "HHI Concentration":        f"{hhi:.3f}",
             "1-Day VaR (95%)":          f"${var_data['var_1d']:,.2f}" if var_data["var_1d"] else "N/A",
@@ -2013,15 +2046,23 @@ with tab_holdings:
             "Information Ratio":        _fmt(info_ratio, ".2f"),
             "Risk-Free Rate Used":      f"{risk_free_rate * 100:.2f}%",
         }
+        def _xl_safe(df: pd.DataFrame) -> pd.DataFrame:
+            # Excel formula-injection guard for text cells starting with =, +, @
+            df = df.copy()
+            for c in df.columns[df.dtypes == object]:
+                df[c] = df[c].map(
+                    lambda v: "'" + v if isinstance(v, str) and v[:1] in "=+@" else v)
+            return df
+
         pd.DataFrame.from_dict(summary, orient="index", columns=["Value"]).to_csv(buf)
         buf.write("\nPOSITION DETAILS\n")
-        positions.to_csv(buf, index=False)
+        _xl_safe(positions).to_csv(buf, index=False)
         buf.write("\nCORRELATION MATRIX\n")
         if not corr.empty:
             corr.round(4).to_csv(buf)
         if not stress_df.empty:
             buf.write("\nSTRESS TEST RESULTS\n")
-            stress_df.to_csv(buf, index=False)
+            _xl_safe(stress_df).to_csv(buf, index=False)
         return buf.getvalue().encode()
 
     st.download_button(

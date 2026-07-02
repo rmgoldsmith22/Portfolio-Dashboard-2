@@ -3,18 +3,10 @@ from __future__ import annotations
 import time
 
 import pandas as pd
-import requests
 import yfinance as yf
 
-# Session with browser-like headers reduces Yahoo Finance rate-limiting on cloud hosts
-_SESSION = requests.Session()
-_SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-})
+# NOTE: yfinance >= 0.2.54 manages its own (curl_cffi) session; passing a custom
+# requests.Session is deprecated there and can break silently. Let yfinance handle it.
 
 
 def _close_from_hist(hist: pd.DataFrame) -> pd.Series | None:
@@ -29,47 +21,52 @@ def fetch_price_history(
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Fetch closing prices at the requested period + interval.
-    Tries Ticker.history() then yf.download() as fallback.
+    One batched yf.download() for all tickers, per-ticker fallback for misses.
     Returns (price_df, failed_tickers). No Streamlit calls.
     """
+    tickers = list(dict.fromkeys(tickers))
     price_data: dict[str, pd.Series] = {}
     failed: list[str] = []
 
-    for ticker in tickers:
-        close = None
+    # Fast path: one batched download for every ticker at once.
+    try:
+        raw = yf.download(
+            tickers, period=period, interval=interval,
+            auto_adjust=True, progress=False, threads=True,
+        )
+        if raw is not None and not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex):
+                closes = raw["Close"]
+            else:  # single ticker → flat columns
+                closes = raw[["Close"]].rename(columns={"Close": tickers[0]})
+            for t in tickers:
+                if t in closes.columns:
+                    series = closes[t].dropna()
+                    if not series.empty:
+                        series.index = pd.DatetimeIndex(series.index.values)
+                        price_data[t] = series.rename(t)
+    except Exception:
+        pass  # fall through to per-ticker fallback
 
-        # Attempt 1: Ticker.history()
+    # Fallback: per-ticker fetch for anything the batch missed.
+    for ticker in tickers:
+        if ticker in price_data:
+            continue
+        close = None
         try:
-            hist = yf.Ticker(ticker, session=_SESSION).history(
+            hist = yf.Ticker(ticker).history(
                 period=period, interval=interval, auto_adjust=True,
             )
             if not hist.empty:
                 close = _close_from_hist(hist)
         except Exception:
             pass
-
-        # Attempt 2: yf.download() fallback
         if close is None or close.empty:
-            try:
-                raw = yf.download(
-                    ticker, period=period, interval=interval, auto_adjust=True,
-                    progress=False, threads=False,
-                )
-                if not raw.empty:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        raw.columns = raw.columns.droplevel(1)
-                    close = _close_from_hist(raw)
-            except Exception:
-                pass
-
-        if close is None or (hasattr(close, "empty") and close.empty):
             failed.append(ticker)
             continue
-
         close.index = pd.DatetimeIndex(close.index.values)
         price_data[ticker] = close.rename(ticker)
-
-        time.sleep(0.15)  # gentle pacing to avoid rate-limit on cloud
+        time.sleep(0.1)  # gentle pacing only on the slow path
 
     if not price_data:
         return pd.DataFrame(), failed
@@ -88,7 +85,7 @@ def fetch_ticker_info(ticker: str) -> dict:
         "website": None, "long_name": None,
     }
     try:
-        info = yf.Ticker(ticker, session=_SESSION).info
+        info = yf.Ticker(ticker).info
         price = (
             info.get("currentPrice")
             or info.get("regularMarketPrice")
@@ -96,7 +93,13 @@ def fetch_ticker_info(ticker: str) -> dict:
             or info.get("previousClose")
         )
         beta = info.get("beta") or info.get("beta3Year")
-        div_yield = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+        # yfinance >= 0.2.54 returns `dividendYield` in PERCENT (0.52 == 0.52%) while
+        # `trailingAnnualDividendYield` stays a fraction. Normalize both to a fraction.
+        div_yield = info.get("dividendYield")
+        if div_yield is not None:
+            div_yield = float(div_yield) / 100.0
+        else:
+            div_yield = info.get("trailingAnnualDividendYield")
         return {
             "current_price":  float(price) if price is not None else None,
             "market_cap":     info.get("marketCap"),
