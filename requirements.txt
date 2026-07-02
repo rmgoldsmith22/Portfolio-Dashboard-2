@@ -1,7 +1,7 @@
 # Python pinned to 3.11 via .python-version so pre-built wheels resolve.
 # Pillow/pandas left as ranges so pip picks a wheel instead of compiling.
 streamlit==1.44.1
-yfinance==0.2.55
+yfinance==1.5.1
 pandas>=2.0.0
 numpy==1.26.4
 plotly==5.24.1
